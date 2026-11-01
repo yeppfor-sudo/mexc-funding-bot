@@ -5,6 +5,7 @@ Finds: wedge breakout -> retest of the broken trendline (previous closed candle)
   LONG  = falling wedge breaks up, price retests the broken upper line
   SHORT = rising wedge breaks down, price retests the broken lower line
 Sends a chart (entry / SL / TP marked) to Telegram. Runs on GitHub Actions.
+Stale signals (too old, SL already hit, price drifted) are skipped.
 """
 import io
 import os
@@ -36,6 +37,10 @@ ENABLE_SHORTS = os.getenv("ENABLE_SHORTS", "true").lower() == "true"
 MIN_VOL_USDT = float(os.getenv("MIN_VOL_USDT", "1000000"))  # 24h turnover filter
 MAX_ALERTS = int(os.getenv("MAX_ALERTS", "25"))             # per run
 WORKERS = int(os.getenv("WORKERS", "6"))
+
+# freshness filter
+MAX_DRIFT = float(os.getenv("MAX_DRIFT", "0.015"))          # max 1.5% away from entry
+MAX_AGE_MIN = float(os.getenv("MAX_AGE_MIN", "120"))        # max minutes since signal candle closed
 
 PIVOT_ORDER = 3     # bars each side to confirm a swing high/low
 LOOKBACK = 90       # max bars of wedge before breakout
@@ -274,6 +279,42 @@ def safe_scan(sym):
         return []
 
 
+# ----------------------------------------------------------------- freshness
+def check_fresh(s, now):
+    """Reject signals that are too old, already hit SL, or drifted away from entry."""
+    entry, sl = s["lv"][0], s["lv"][1]
+    sec = TF[s["tf"]][2]
+    close_ts = s["df"].index[-1].timestamp() + sec        # when the signal candle closed
+    age = now - close_ts
+    if age > min(sec, MAX_AGE_MIN * 60):
+        return False, f"too old ({age / 60:.0f} min)"
+
+    j = api_get("/api/v1/contract/ticker", {"symbol": s["sym"]})
+    d = j.get("data") if j else None
+    if isinstance(d, list):
+        d = d[0] if d else None
+    if not d or not d.get("lastPrice"):
+        return True, "no live price"
+    last = float(d["lastPrice"])
+    if s["side"] == "long" and last <= sl:
+        return False, f"price {fmt(last)} below SL"
+    if s["side"] == "short" and last >= sl:
+        return False, f"price {fmt(last)} above SL"
+    if abs(last - entry) / entry > MAX_DRIFT:
+        return False, f"drifted from entry (now {fmt(last)})"
+
+    # did a wick already hit SL since the candle closed?
+    k = api_get(f"/api/v1/contract/kline/{s['sym']}",
+                {"interval": "Min5", "start": int(close_ts), "end": int(now)})
+    kd = (k or {}).get("data") or {}
+    if kd.get("low"):
+        if s["side"] == "long" and min(kd["low"]) <= sl:
+            return False, "SL already touched"
+        if s["side"] == "short" and max(kd["high"]) >= sl:
+            return False, "SL already touched"
+    return True, "fresh"
+
+
 # ----------------------------------------------------------------- output
 def fmt(x):
     if x == 0:
@@ -414,7 +455,18 @@ def main():
     new.sort(key=lambda s: -TIMEFRAMES.index(s["tf"]))
     print(f"Signals: {len(sigs)} | new: {len(new)} | took {time.time() - t0:.0f}s")
 
-    for s in new[:MAX_ALERTS]:
+    now = time.time()
+    fresh = []
+    for s in new:
+        ok, why = check_fresh(s, now)
+        if ok:
+            fresh.append(s)
+        else:
+            print(f"[skip] {s['sym']} {s['tf']} {s['side']}: {why}")
+            state[s["key"]] = int(now)   # don't re-check dead signals
+    print(f"Fresh: {len(fresh)}")
+
+    for s in fresh[:MAX_ALERTS]:
         try:
             ok = tg_photo(make_chart(s), caption(s))
         except Exception as e:
