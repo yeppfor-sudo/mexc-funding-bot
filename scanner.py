@@ -4,8 +4,10 @@ MEXC perpetual scanner
 Finds: wedge breakout -> retest of the broken trendline (previous closed candle)
   LONG  = falling wedge breaks up, price retests the broken upper line
   SHORT = rising wedge breaks down, price retests the broken lower line
+Also finds CHoCH (change of character):
+  LONG  = downtrend (lower high + lower low), last closed candle is the first close above the last lower high
+  SHORT = mirror (uptrend, first close below the last higher low)
 Sends a chart (entry / SL / TP marked) to Telegram. Runs on GitHub Actions.
-Stale signals (too old, SL already hit, price drifted) are skipped.
 """
 import io
 import os
@@ -34,13 +36,11 @@ CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 TIMEFRAMES = [t.strip() for t in os.getenv("TIMEFRAMES", "1h,2h,4h,8h,12h,1d,3d,7d").split(",") if t.strip()]
 EMA_MODE = os.getenv("EMA_MODE", "basic").lower()          # off | basic | strict
 ENABLE_SHORTS = os.getenv("ENABLE_SHORTS", "true").lower() == "true"
+ENABLE_WEDGE = os.getenv("ENABLE_WEDGE", "true").lower() == "true"
+ENABLE_CHOCH = os.getenv("ENABLE_CHOCH", "true").lower() == "true"
 MIN_VOL_USDT = float(os.getenv("MIN_VOL_USDT", "1000000"))  # 24h turnover filter
 MAX_ALERTS = int(os.getenv("MAX_ALERTS", "25"))             # per run
 WORKERS = int(os.getenv("WORKERS", "6"))
-
-# freshness filter
-MAX_DRIFT = float(os.getenv("MAX_DRIFT", "0.015"))          # max 1.5% away from entry
-MAX_AGE_MIN = float(os.getenv("MAX_AGE_MIN", "120"))        # max minutes since signal candle closed
 
 PIVOT_ORDER = 3     # bars each side to confirm a swing high/low
 LOOKBACK = 90       # max bars of wedge before breakout
@@ -226,6 +226,47 @@ def detect(df):
     return None
 
 
+def detect_choch(df):
+    """Bullish CHoCH on the last closed candle: LH + LL structure, then first close above the last LH."""
+    n = len(df)
+    if n < 60:
+        return None
+    h, l, c = df.high.values, df.low.values, df.close.values
+    last = n - 1
+    a = atr(df).iloc[-1]
+    if not np.isfinite(a) or a <= 0:
+        return None
+    ph = [i for i in pivots(h, PIVOT_ORDER, True) if i >= last - LOOKBACK]
+    pl = [i for i in pivots(l, PIVOT_ORDER, False) if i >= last - LOOKBACK]
+    if len(ph) < 2 or len(pl) < 2:
+        return None
+    h1, h2 = ph[-2], ph[-1]
+    l1, l2 = pl[-2], pl[-1]
+    if not (h[h2] < h[h1] and l[l2] < l[l1] and l2 > h2):   # lower high, lower low, low after the high
+        return None
+    lvl = h[h2]
+    if not c[last] > lvl + 0.1 * a:                         # closes above last lower high
+        return None
+    if c[last] - lvl > 2 * a:                               # not already extended
+        return None
+    if np.any(c[h2 + 1:last] > lvl):                        # must be the FIRST close above
+        return None
+    return dict(kind="choch", start=h1, bi=last, level=float(lvl), h1=h1, h2=h2, l1=l1, l2=l2,
+                h1v=float(h[h1]), h2v=float(h[h2]), atr=a)
+
+
+def choch_levels(d, res, sgn):
+    last = len(d) - 1
+    entry = d.close.values[last]
+    sl = d.low.values[res["l2"]] - SL_ATR * res["atr"]
+    risk = entry - sl
+    if risk <= 0 or risk > 10 * res["atr"]:
+        return None
+    tp1, tp2 = entry + 1.5 * risk, entry + 2.5 * risk
+    tp3 = res["h1v"] if res["h1v"] > tp2 else entry + 4 * risk   # previous lower high
+    return [float(sgn * x) for x in (entry, sl, tp1, tp2, tp3)]
+
+
 def trade_levels(d, res, sgn):
     last = len(d) - 1
     ul = res["mh"] * last + res["bh"]
@@ -260,14 +301,23 @@ def scan_symbol(sym):
             if side == "short" and not ENABLE_SHORTS:
                 continue
             d = df if sgn == 1 else invert(df)
-            res = detect(d)
-            if not res or not ema_ok(d):
-                continue
-            lv = trade_levels(d, res, sgn)
-            if not lv:
-                continue
-            out.append(dict(sym=sym, tf=tf, side=side, sgn=sgn, df=df, res=res, lv=lv,
-                            key=f"{sym}|{tf}|{side}|{int(df.index[res['bi']].timestamp())}"))
+            for kind in ("wedge", "choch"):
+                if (kind == "wedge" and not ENABLE_WEDGE) or (kind == "choch" and not ENABLE_CHOCH):
+                    continue
+                if kind == "wedge":
+                    res = detect(d)
+                    if not res or not ema_ok(d):
+                        continue
+                    lv = trade_levels(d, res, sgn)
+                else:
+                    res = detect_choch(d)
+                    if not res:
+                        continue
+                    lv = choch_levels(d, res, sgn)
+                if not lv:
+                    continue
+                out.append(dict(sym=sym, tf=tf, side=side, sgn=sgn, kind=kind, df=df, res=res, lv=lv,
+                                key=f"{sym}|{tf}|{side}|{kind}|{int(df.index[res['bi']].timestamp())}"))
     return out
 
 
@@ -279,42 +329,6 @@ def safe_scan(sym):
         return []
 
 
-# ----------------------------------------------------------------- freshness
-def check_fresh(s, now):
-    """Reject signals that are too old, already hit SL, or drifted away from entry."""
-    entry, sl = s["lv"][0], s["lv"][1]
-    sec = TF[s["tf"]][2]
-    close_ts = s["df"].index[-1].timestamp() + sec        # when the signal candle closed
-    age = now - close_ts
-    if age > min(sec, MAX_AGE_MIN * 60):
-        return False, f"too old ({age / 60:.0f} min)"
-
-    j = api_get("/api/v1/contract/ticker", {"symbol": s["sym"]})
-    d = j.get("data") if j else None
-    if isinstance(d, list):
-        d = d[0] if d else None
-    if not d or not d.get("lastPrice"):
-        return True, "no live price"
-    last = float(d["lastPrice"])
-    if s["side"] == "long" and last <= sl:
-        return False, f"price {fmt(last)} below SL"
-    if s["side"] == "short" and last >= sl:
-        return False, f"price {fmt(last)} above SL"
-    if abs(last - entry) / entry > MAX_DRIFT:
-        return False, f"drifted from entry (now {fmt(last)})"
-
-    # did a wick already hit SL since the candle closed?
-    k = api_get(f"/api/v1/contract/kline/{s['sym']}",
-                {"interval": "Min5", "start": int(close_ts), "end": int(now)})
-    kd = (k or {}).get("data") or {}
-    if kd.get("low"):
-        if s["side"] == "long" and min(kd["low"]) <= sl:
-            return False, "SL already touched"
-        if s["side"] == "short" and max(kd["high"]) >= sl:
-            return False, "SL already touched"
-    return True, "fresh"
-
-
 # ----------------------------------------------------------------- output
 def fmt(x):
     if x == 0:
@@ -322,6 +336,12 @@ def fmt(x):
     d = max(2, 5 - int(math.floor(math.log10(abs(x)))))
     s = f"{x:.{d}f}"
     return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def kind_text(s):
+    if s["kind"] == "choch":
+        return "Bullish CHoCH (change of character)" if s["side"] == "long" else "Bearish CHoCH (change of character)"
+    return "Falling wedge breakout → retest" if s["side"] == "long" else "Rising wedge breakdown → retest"
 
 
 def make_chart(s):
@@ -340,7 +360,8 @@ def make_chart(s):
                                     color=col, width=0.9))
     off = res["atr"] * 0.6
     mk = "^" if sgn == 1 else "v"
-    for bar, color in ((res["bi"], "#ffd166"), (last, "#00e5ff")):
+    marks = ((res["bi"], "#ffd166"), (last, "#00e5ff")) if s["kind"] == "wedge" else ((last, "#00e5ff"),)
+    for bar, color in marks:
         if bar < lo:
             continue
         m = pd.Series(np.nan, index=idx)
@@ -348,17 +369,23 @@ def make_chart(s):
         m.iloc[k] = p.Low.iloc[k] - off if sgn == 1 else p.High.iloc[k] + off
         aps.append(mpf.make_addplot(m, type="scatter", marker=mk, markersize=90, color=color))
 
-    x0 = max(res["start"], lo)
-    def line(m, b):
-        return [(df.index[x], float(sgn * (m * x + b))) for x in (x0, last)]
-    alines = dict(alines=[line(res["mh"], res["bh"]), line(res["ml"], res["bl"])],
-                  colors=["#ffd166", "#a0a0ff"], linewidths=1.4)
+    if s["kind"] == "wedge":
+        x0 = max(res["start"], lo)
+        def line(m, b):
+            return [(df.index[x], float(sgn * (m * x + b))) for x in (x0, last)]
+        alines = dict(alines=[line(res["mh"], res["bh"]), line(res["ml"], res["bl"])],
+                      colors=["#ffd166", "#a0a0ff"], linewidths=1.4)
+    else:
+        ix = df.index
+        alines = dict(alines=[
+            [(ix[res["h1"]], sgn * res["h1v"]), (ix[res["h2"]], sgn * res["h2v"])],   # lower-high leg
+            [(ix[res["h2"]], sgn * res["level"]), (ix[last], sgn * res["level"])],     # CHoCH level
+        ], colors=["#a0a0ff", "#ffd166"], linewidths=1.4)
 
     lv = s["lv"]
     cols = ["#ffffff", "#ff4d4d", "#06d6a0", "#06d6a0", "#06d6a0"]
     names = ["ENTRY", "SL", "TP1", "TP2", "TP3"]
-    kind = "Falling wedge breakout retest" if sgn == 1 else "Rising wedge breakdown retest"
-    title = f"{s['sym']} PERP  {s['tf']}  {s['side'].upper()}  |  {kind}"
+    title = f"{s['sym']} PERP  {s['tf']}  {s['side'].upper()}  |  {kind_text(s)}"
 
     fig, axes = mpf.plot(p, type="candle", style="nightclouds", addplot=aps, alines=alines,
                          hlines=dict(hlines=lv, colors=cols, linestyle="--", linewidths=0.9),
@@ -383,7 +410,7 @@ def caption(s):
     c = df.close
     e = [c.ewm(span=x, adjust=False).mean().iloc[-1] for x in (6, 12, 20)]
     icon = "🟢" if s["side"] == "long" else "🔴"
-    kind = "Falling wedge breakout → retest" if s["side"] == "long" else "Rising wedge breakdown → retest"
+    kind = kind_text(s)
     t = df.index[-1].strftime("%Y-%m-%d %H:%M")
     return (
         f"{icon} <b>{s['side'].upper()}</b> · <b>{html.escape(s['sym'])}</b> (MEXC Perp)\n"
@@ -455,18 +482,7 @@ def main():
     new.sort(key=lambda s: -TIMEFRAMES.index(s["tf"]))
     print(f"Signals: {len(sigs)} | new: {len(new)} | took {time.time() - t0:.0f}s")
 
-    now = time.time()
-    fresh = []
-    for s in new:
-        ok, why = check_fresh(s, now)
-        if ok:
-            fresh.append(s)
-        else:
-            print(f"[skip] {s['sym']} {s['tf']} {s['side']}: {why}")
-            state[s["key"]] = int(now)   # don't re-check dead signals
-    print(f"Fresh: {len(fresh)}")
-
-    for s in fresh[:MAX_ALERTS]:
+    for s in new[:MAX_ALERTS]:
         try:
             ok = tg_photo(make_chart(s), caption(s))
         except Exception as e:
