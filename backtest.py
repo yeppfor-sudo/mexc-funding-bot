@@ -5,7 +5,7 @@ Backtest of the bearish-CHoCH short strategy used by bot.py (MEXC perps, 15m).
 Replicates the bot: signal on candle close -> limit SELL at the middle of the 0.382-0.618
 retrace zone (cancels after N bars) -> SL at range top, TP at RR x risk -> risk-based sizing,
 leverage cap, max open positions, daily loss halt, MEXC API fees (maker 0.01% / taker 0.05%).
-
+n
 Conservative candle rules (OHLC can't show intrabar order):
   * if SL and TP are both touched in one candle -> SL wins
   * no TP on the candle where the entry filled
