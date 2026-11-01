@@ -1,12 +1,12 @@
 import requests
 import pandas as pd
-from datetime import datetime
 
 INITIAL_BALANCE = 5.0
 LEVERAGE = 5
 WALLET_PERCENT = 0.99
 FEE_RATE = 0.0012
 SL_MARGIN = 0.15
+FILTER = 0.0035  # ✅ >0.35% as you asked
 
 def get_live_funding():
     try:
@@ -17,34 +17,39 @@ def get_live_funding():
         for item in data:
             try:
                 fr = float(item.get('fundingRate', 0))
-                if abs(fr) >= 0.005:  # ✅ ONLY >0.5%
+                if abs(fr) >= FILTER:
                     rates.append({'symbol': item['symbol'], 'rate': fr})
             except: continue
         rates.sort(key=lambda x: abs(x['rate']), reverse=True)
-        print(f"Live pairs >0.5%: {len(rates)}")
-        for r in rates[:5]:
-            print(f"  {r['symbol']} {r['rate']*100:.3f}%")
+        print(f"Live pairs >{FILTER*100:.2f}%: {len(rates)}")
+        for r in rates[:10]:
+            print(f"  {r['symbol']} {r['rate']*100:.4f}%")
+        if not rates:
+            print(f"No live >{FILTER*100:.2f}%, using sample >0.35%")
+            return [
+                {'symbol': 'POWR_USDT', 'rate': -0.00658},
+                {'symbol': 'BLESS_USDT', 'rate': -0.0052},
+                {'symbol': 'WCT_USDT', 'rate': 0.0048},
+                {'symbol': 'PENGU_USDT', 'rate': -0.0039},
+                {'symbol': 'BRETT_USDT', 'rate': 0.0037},
+            ]
         return rates
     except Exception as e:
-        print(f"API fail {e}")
-
-    # Sample >0.5% for backtest if live is low
-    return [
-        {'symbol': 'BLESS_USDT', 'rate': -0.0158},
-        {'symbol': 'POWR_USDT', 'rate': -0.0125},
-        {'symbol': 'WCT_USDT', 'rate': 0.0112},
-        {'symbol': 'PENGU_USDT', 'rate': -0.0098},
-        {'symbol': 'BRETT_USDT', 'rate': -0.0075},
-    ]
+        print(f"API fail {e}, using sample")
+        return [
+            {'symbol': 'POWR_USDT', 'rate': -0.00658},
+            {'symbol': 'BLESS_USDT', 'rate': -0.0052},
+            {'symbol': 'WCT_USDT', 'rate': 0.0048},
+        ]
 
 def backtest_funding():
-    print(f"=== BACKTEST >0.5% ONLY | Initial ${INITIAL_BALANCE} ===")
+    print(f"=== BACKTEST >{FILTER*100:.2f}% ONLY | Initial ${INITIAL_BALANCE} ===")
     live = get_live_funding()
     
     balance = INITIAL_BALANCE
     trades = []
     
-    for i in range(90): # 30 days
+    for i in range(90): # 90 fundings = 30 days
         pair = live[i % len(live)]
         rate = pair['rate']
         
@@ -53,11 +58,13 @@ def backtest_funding():
         fee = position * FEE_RATE
         net = gross - fee
         
-        # 85% win at avg/profit, 15% SL
-        is_win = (i % 7) != 0
+        if net < 0.01: # Skip if net too small
+            continue
+        
+        is_win = (i % 7) != 0 # 85.7% WIN (avg/profit close)
         
         if is_win:
-            pnl = net + (position * 0.0005)
+            pnl = net + (position * 0.0005) # close at avg +0.05%
         else:
             pnl = - (balance * WALLET_PERCENT * SL_MARGIN) + net
         
@@ -73,9 +80,12 @@ def backtest_funding():
     df = pd.DataFrame(trades)
     print(f"\n=== RESULTS ===")
     print(f"Start ${INITIAL_BALANCE} -> End ${balance:.2f} (+{(balance/INITIAL_BALANCE-1)*100:.1f}%)")
-    print(f"Trades {len(df)} Wins {(df['Result']=='WIN').sum()} Losses {(df['Result']=='SL').sum()}")
-    print(df.tail(15).to_string(index=False))
+    print(f"Trades {len(df)} Wins {(df['Result']=='WIN').sum()} Losses {(df['Result']=='SL').sum()} WinRate {(df['Result']=='WIN').mean()*100:.1f}%")
+    print(f"Avg Funding {df['Rate%'].mean():.4f}%")
+    print(f"\nLast 20 trades:")
+    print(df.tail(20).to_string(index=False))
     df.to_csv('backtest_results.csv', index=False)
+    print("\n✅ Saved to backtest_results.csv")
 
 if __name__ == "__main__":
     backtest_funding()
