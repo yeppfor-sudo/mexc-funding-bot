@@ -1,0 +1,106 @@
+# MEXC Perpetual Bearish CHoCH Scanner (15m)
+
+Scans all MEXC USDT perpetual pairs every 15 minutes and sends a Telegram alert
+(chart + short zone, SL, TP1/TP2) when a **bearish Change of Character** prints on the
+last closed 15m candle. Alerts only, it does not place trades.
+
+## Setup
+1. Create a bot with [@BotFather](https://t.me/BotFather) -> get `TELEGRAM_TOKEN`.
+2. Get your chat id (message the bot, then open `https://api.telegram.org/bot<TOKEN>/getUpdates`) -> `CHAT_ID`.
+3. Push this repo to GitHub, then **Settings -> Secrets and variables -> Actions** and add
+   `TELEGRAM_TOKEN` and `CHAT_ID`.
+4. **Actions** tab -> enable workflows -> run "MEXC bearish CHoCH scan" once manually.
+
+## Run locally
+```bash
+pip install -r requirements.txt
+python scanner.py --dry-run                      # prints instead of sending
+TELEGRAM_TOKEN=xxx CHAT_ID=yyy python scanner.py
+```
+
+## Options
+| Flag | Default | Meaning |
+|---|---|---|
+| `--fractal` | 7 | pivot length (bars each side) |
+| `--check-bars` | 2 | how many closed candles back count as "new" (covers GitHub cron delay) |
+| `--min-gain` | off | only pairs up >= X% over 48h |
+| `--top` | off | only the top N 48h gainers |
+| `--include-majors` | off | also scan BTC, ETH, SOL, etc. |
+| `--cooldown` | 2 | hours before the same pair can alert again |
+| `--dry-run` | off | print only |
+
+Env: `TZ_NAME` (default `Asia/Karachi`), `FRACTAL_LEN`.
+
+## Signal logic
+- Structure turns bullish when a candle closes above the latest confirmed pivot high.
+- **Bearish CHoCH** = in bullish structure, a candle **closes below** the latest confirmed pivot low.
+- Pivots are only used after `fractal` bars have passed (no repainting). The live candle is ignored.
+- Short zone = 0.382-0.618 retrace of the move from range top to the CHoCH low.
+  SL = range top. TP1/TP2 = 1R/2R from the zone midpoint. These are reference levels, not advice.
+
+## Notes
+- Public data only, no MEXC API keys needed.
+- Perps are high risk. Backtest/paper trade before acting on any signal.
+
+---
+
+# Auto-trading bot (`bot.py`)
+
+Shorts MEXC perpetuals on a bearish CHoCH (15m). **Paper mode by default.**
+
+## Run (paper, no keys needed)
+```bash
+python bot.py                      # simulated $1000 account, 0.5% risk/trade, 3x lev, 2R target
+python bot.py --risk-pct 1 --top 30 --min-gain 10
+```
+Results are logged to `trades.jsonl`; open setups live in `bot_state.json`. Let it run for
+a few weeks and check win rate / expectancy before going live.
+
+## Run live (real money)
+1. KYC-verified MEXC account, create an API key with **Futures trade permission only**
+   (no withdrawals) and **IP whitelist** it. MEXC API futures fees: maker 0.01% / taker 0.05%.
+   Innovation Zone pairs are excluded from API trading (the bot skips them).
+2. Use a dedicated sub-account (the bot calls cancel-all on its own symbols).
+3. ```bash
+   export MEXC_API_KEY=... MEXC_API_SECRET=...
+   export TELEGRAM_TOKEN=... CHAT_ID=...          # optional but recommended
+   export I_UNDERSTAND_LIVE_TRADING=yes
+   python bot.py --live --risk-pct 0.25 --leverage 2 --max-positions 1
+   ```
+4. Confirm in the MEXC app that the stop-loss order really appears on the first fill.
+5. Must run 24/7 on a VPS (`tmux`, `systemd` or Docker). **Not** GitHub Actions.
+
+## Safety features
+- Risk-based sizing (`--risk-pct`), leverage cap, max open positions, max SL distance
+- Daily loss halt (`--daily-loss-pct`), kill switch: create a file named `STOP` to block new entries
+- Entry is a limit order in the retrace zone and auto-cancels if unfilled or if the SL level is hit first
+- Exchange-side SL + TP, plus a bot-side stop as backup. If the exchange SL can't be placed,
+  the position is closed immediately (`--no-require-exchange-sl` to disable)
+
+## Not verified
+Live order placement has not been tested against the real MEXC API (no network in my build
+environment). The paper engine was tested with a mock. Test live with the minimum size first.
+
+---
+
+# Backtest (`backtest.py`)
+
+```bash
+pip install -r requirements.txt
+python backtest.py --days 180 --universe 80          # downloads + caches MEXC 15m history in ./data
+python backtest.py --days 180 --universe 80 --sweep  # RR x fractal grid
+python backtest.py --synthetic 60 --days 240         # random-walk sanity check
+```
+It replays the exact bot rules (entry limit in retrace zone with expiry, SL/TP, risk sizing,
+leverage cap, max positions, daily loss halt, MEXC API fees + stop slippage) and reports
+win rate, avg R, profit factor, return, max drawdown, a first-half vs second-half stability
+check and symbol concentration. Outputs `backtest_trades.csv` and `backtest_equity.png`.
+
+How to read it
+- On random-walk data the strategy should lose roughly the fees. If your real result isn't clearly
+  better than that sanity run, there is no edge.
+- Prefer configurations that are profitable in **both** halves and not dominated by 2-3 symbols.
+- `--sweep` picks the best of 12 combos, which is selection bias. Validate the winner on
+  data it wasn't chosen on (different dates / different symbols).
+- Limitations: the universe is today's top-volume perps (delisted coins are missing, so results
+  look better than reality), OHLC can't show intrabar order, and funding rates are not included.
