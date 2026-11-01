@@ -1,7 +1,0 @@
-ccxt
-pandas
-numpy
-scikit-learn
-websockets
-requests
-pytz
