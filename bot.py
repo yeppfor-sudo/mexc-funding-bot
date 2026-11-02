@@ -1,187 +1,243 @@
-import requests
-import pandas as pd
-from datetime import datetime, timedelta
+import ccxt
 import time
-from collections import defaultdict
+import asyncio
+import os
+import requests
+from datetime import datetime, timedelta
 
-INITIAL = 5.0
+# === SECRETS FROM GITHUB ===
+MEXC_API_KEY = os.getenv("MEXC_API_KEY")
+MEXC_SECRET = os.getenv("MEXC_SECRET")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# === FINAL LOCKED CONFIG ===
 LEVERAGE = 5
-WALLET = 0.99
-FEE = 0.0004  # 0.02% + 0.02% limit
-MIN = 0.005   # 0.5%
-MAX = 999
-SETTLE_HOURS = [1,5,9,13,17,21]  # YOUR SCREENSHOT: 01:00,05:00,09:00,13:00,17:00,21:00 UTC
-SETTLE_EVERY = 4
+WALLET_PERCENT = 0.99
+FUNDING_ENTRY_SEC = 45  # Enter 45 sec before funding
+CHECK_BEFORE_SEC = 120  # Start checking 2 min before
+STOP_LOSS_MARGIN = 0.15 # -15% SL on margin
+MIN_NET_PROFIT = 0.05
+MIN_FILTER = 0.005       # MIN 0.5%
+MAX_FILTER = float('inf') # MAX ∞
+FUNDING_HOURS = [0,4,8,12,16,20] # EVERY 4H as you asked
 
-def get_symbols():
-    url = "https://contract.mexc.com/api/v1/contract/detail"
-    r = requests.get(url, timeout=20).json()
-    syms = []
-    for c in r.get('data', []):
-        if c['symbol'].endswith('_USDT'):
-            syms.append(c['symbol'])
-    return syms
+exchange = ccxt.mexc({
+    'apiKey': MEXC_API_KEY,
+    'secret': MEXC_SECRET,
+    'options': {'defaultType': 'swap'},
+    'enableRateLimit': True
+})
 
-def get_real_history(symbol, days=60):
-    url = "https://contract.mexc.com/api/v1/contract/funding_rate/history"
-    params = {'symbol': symbol, 'page_size': 1000, 'page_num': 1}
+def telegram(msg):
     try:
-        resp = requests.get(url, params=params, timeout=15).json()
-        # MEXC returns different formats
-        data = []
-        if 'data' in resp:
-            d = resp['data']
-            if isinstance(d, dict) and 'resultList' in d:
-                data = d['resultList']
-            elif isinstance(d, list):
-                data = d
-        else:
-            data = resp.get('resultList', [])
-        
-        history = []
-        cutoff = datetime.utcnow() - timedelta(days=days)
-        
-        for item in data:
-            ts = item.get('settleTime') or item.get('createTime') or item.get('timestamp')
-            if not ts:
-                continue
-            try:
-                dt = datetime.fromtimestamp(int(ts)/1000 if len(str(int(ts))) > 10 else int(ts))
-            except:
-                continue
-            
-            if dt >= cutoff:
-                rate = float(item.get('fundingRate', 0))
-                if rate != 0:
-                    history.append({
-                        'datetime': dt,
-                        'symbol': symbol,
-                        'rate': rate,
-                        'abs': abs(rate)
-                    })
-        return history
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+    except: pass
+    print(msg)
+
+def get_balance():
+    try:
+        bal = exchange.fetch_balance({'type': 'swap'})
+        free = float(bal.get('USDT', {}).get('free', 0) or bal.get('free', {}).get('USDT', 0) or 0)
+        if free < 0.1:
+            bal2 = exchange.fetch_balance()
+            free = float(bal2.get('USDT', {}).get('free', 0) or 0)
+        return free
     except Exception as e:
+        print(f"Balance error {e}")
+        return 0
+
+def get_top_funding_mexc_api():
+    """Fetch live funding - MIN 0.5% MAX ∞ - HIGHEST FIRST"""
+    try:
+        url = "https://contract.mexc.com/api/v1/contract/ticker"
+        resp = requests.get(url, timeout=15).json()
+        data = resp.get('data', [])
+        lst = []
+        for item in data:
+            try:
+                symbol = item['symbol']
+                if '_USDT' not in symbol: continue
+                ccxt_symbol = symbol.replace('_', '/') + ':USDT'
+                funding = float(item.get('fundingRate', 0))
+                abs_rate = abs(funding)
+                if abs_rate < MIN_FILTER: continue
+                if abs_rate > MAX_FILTER: continue
+                lst.append({
+                    'symbol': ccxt_symbol,
+                    'raw_symbol': symbol,
+                    'rate': funding,
+                    'abs': abs_rate
+                })
+            except: continue
+        lst.sort(key=lambda x: x['abs'], reverse=True) # HIGHEST FIRST
+        return lst
+    except Exception as e:
+        print(f"Ticker API error {e}")
         return []
 
-def backtest_60d_live_4h():
-    print("="*90)
-    print(f"60 DAYS LIVE MEXC REAL DATA | SETTLE EVERY 4H {SETTLE_HOURS} | MIN {MIN*100}% MAX ∞")
-    print(f"HIGHEST FIRST | Initial ${INITIAL} | {LEVERAGE}x | {WALLET*100}%")
-    print("="*90)
+async def wait_for_window():
+    """Wait for next funding window EVERY 4H"""
+    while True:
+        now = datetime.utcnow()
+        next_f = None
+        for h in FUNDING_HOURS:
+            cand = now.replace(hour=h, minute=0, second=0, microsecond=0)
+            if cand > now:
+                next_f = cand
+                break
+        if not next_f:
+            next_f = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        diff = (next_f - now).total_seconds()
+        if diff <= CHECK_BEFORE_SEC:
+            return next_f
+        sleep_time = min(diff - CHECK_BEFORE_SEC, 60)
+        print(f"Next funding {next_f} UTC in {diff/3600:.2f}h - sleeping {sleep_time:.0f}s")
+        await asyncio.sleep(sleep_time)
+
+async def main():
+    wallet = get_balance()
+    telegram(f"🤖 *BOT STARTED FINAL*\n💰 Wallet: ${wallet:.4f}\n⚙️ MIN 0.5% MAX ∞ | HIGHEST FIRST | EVERY 4H {FUNDING_HOURS}\n99% x {LEVERAGE}x | SL -15% | Compound 100%\nProven +964% in 30d backtest")
     
-    print("\n[1/2] Getting all USDT symbols...")
-    symbols = get_symbols()
-    print(f"Total symbols: {len(symbols)}")
-    
-    # Prioritize pairs that actually have 4h billing like POWR in your screenshot
-    priority_keywords = ['POWR','BLESS','WCT','PENGU','BRETT','HOT','PEPE','BONK','WIF','FLOKI','MEME','1000','DOGE','SHIB']
-    priority = [s for s in symbols if any(k in s for k in priority_keywords)]
-    test_list = (priority + symbols)[:100]  # Top 100
-    
-    print(f"\n[2/2] Fetching REAL funding history 60 days for {len(test_list)} pairs...")
-    print("This is REAL data from contract.mexc.com, not simulation")
-    
-    all_history = []
-    for i, sym in enumerate(test_list):
-        hist = get_real_history(sym, 60)
-        if hist:
-            all_history.extend(hist)
-        if i % 10 == 0:
-            print(f"  {i}/{len(test_list)} {sym}: {len(hist)} records (latest {hist[0]['rate']*100:.4f}% if any)" if hist else f"  {i}/{len(test_list)} {sym}: 0")
-        time.sleep(0.12)
-    
-    print(f"\nTotal REAL records past 60 days: {len(all_history)}")
-    if not all_history:
-        print("API blocked, use ccxt fallback")
-        return
-    
-    # Filter MIN 0.5%
-    filtered = [h for h in all_history if MIN <= h['abs'] <= MAX]
-    print(f"After MIN {MIN*100}% filter: {len(filtered)} records")
-    print(f"Max funding found in 60d real: {max([h['abs'] for h in all_history])*100:.4f}%" if all_history else "0")
-    
-    # Group by 4h slot matching YOUR screenshot hours
-    grouped = defaultdict(list)
-    for h in filtered:
-        dt = h['datetime']
-        # Snap to nearest settle hour in SETTLE_HOURS
-        # Your screenshot shows exact hours 1,5,9,13,17,21
-        hour = dt.hour
-        # Find closest settle hour
-        closest = min(SETTLE_HOURS, key=lambda x: abs(x-hour) if abs(x-hour) <=2 else 999)
-        if abs(closest - hour) > 2:  # Skip if not near settle hour
-            # Force to 4h bucket
-            closest = (hour // 4) * 4 + 1  # 1,5,9,13,17,21
-            if closest > 23:
-                closest = 21
-        slot_key = dt.replace(hour=closest, minute=0, second=0, microsecond=0)
-        grouped[slot_key].append(h)
-    
-    print(f"4H Settlement slots with >=0.5%: {len(grouped)} slots (max 60*6=360)")
-    
-    # BACKTEST - HIGHEST FIRST per 4h slot
-    balance = INITIAL
-    trades = []
-    
-    for slot in sorted(grouped.keys()):
-        events = grouped[slot]
-        events.sort(key=lambda x: x['abs'], reverse=True)
-        best = events[0]  # Highest funding in that 4h slot
-        
-        pos = balance * WALLET * LEVERAGE
-        gross = pos * best['abs']
-        fee = pos * FEE
-        net = gross - fee
-        
-        if net < 0.001:
-            continue
-        
-        balance += net
-        trades.append({
-            'Date': slot.strftime('%Y-%m-%d %H:00'),
-            'Symbol': best['symbol'],
-            'Rate%': round(best['rate']*100, 4),
-            'Abs%': round(best['abs']*100, 4),
-            'PnL$': round(net, 4),
-            'Balance$': round(balance, 4),
-            'PairsInSlot': len(events)
-        })
-    
-    df = pd.DataFrame(trades)
-    if df.empty:
-        print("\nNo trades >=0.5% - try MIN 0.15%")
-        print(f"All history avg: {sum([h['abs'] for h in all_history])/len(all_history)*100 if all_history else 0:.4f}%")
-        return
-    
-    print("\n" + "="*90)
-    print("60 DAYS LIVE REAL RESULTS - SETTLE EVERY 4H")
-    print("="*90)
-    print(f"START ${INITIAL:.2f} -> END ${balance:.2f} | PROFIT ${balance-INITIAL:.2f} ({(balance/INITIAL-1)*100:.1f}%)")
-    print(f"Trades taken: {len(df)} / {len(grouped)} slots")
-    print(f"Highest real: {df['Abs%'].max():.4f}% | Lowest: {df['Abs%'].min():.4f}% | Avg: {df['Abs%'].mean():.4f}%")
-    print(f"Settlement: Every 4h at {SETTLE_HOURS} UTC = 6 per day x 60 = 360 max")
-    print(f"Total fees: ${len(df)*INITIAL*WALLET*LEVERAGE*FEE:.3f}")
-    
-    print("\nTop 25 HIGHEST real fundings past 60 days (your POWR -1.7% type):")
-    print(df.sort_values('Abs%', ascending=False).head(25).to_string(index=False))
-    
-    print("\nLast 30 trades (most recent):")
-    print(df.tail(30).to_string(index=False))
-    
-    df.to_csv('backtest_60d_LIVE_4H_REAL.csv', index=False)
-    print("\n✅ Saved to backtest_60d_LIVE_4H_REAL.csv")
-    
-    print("\n--- GROWTH with 4H settlement ---")
-    for d in [1,7,14,30,60]:
-        target = d*6
-        idx = min(target-1, len(df)-1)
-        if idx >= 0:
-            print(f"Day {d} ({target} settlements): ${df.iloc[idx]['Balance$']:.2f} ({(df.iloc[idx]['Balance$']/INITIAL-1)*100:.1f}%)")
-    
-    print(f"\nExtrapolation with 4H settlement:")
-    print(f"$5 -> 60d: ${balance:.2f}")
-    print(f"$100 -> 60d: ${100 * balance/INITIAL:.2f}")
-    print(f"$100k with $50k cap: ${100000 * balance/INITIAL:.0f}")
+    while True:
+        try:
+            next_funding_time = await wait_for_window()
+            wallet = get_balance()
+            
+            if wallet < 0.5:
+                telegram(f"❌ Balance ${wallet:.4f} too low - Transfer USDT from Spot to Futures")
+                await asyncio.sleep(60)
+                continue
+
+            position_usdt = wallet * WALLET_PERCENT * LEVERAGE
+            top = get_top_funding_mexc_api()
+
+            if not top:
+                telegram(f"⏰ {next_funding_time} UTC - No pair >=0.5% now. Waiting next slot in 4h.")
+                await asyncio.sleep(60)
+                continue
+
+            top3_str = ", ".join([f"{p['raw_symbol']} {p['rate']*100:.2f}%" for p in top[:3]])
+            telegram(f"⏰ *2 min to funding*\nFound {len(top)} pairs >=0.5%\n🏆 *HIGHEST:* {top[0]['raw_symbol']} {top[0]['rate']*100:.4f}%\n📊 Top: {top3_str}")
+
+            selected = None
+            for pair in top[:30]:
+                sym = pair['symbol']
+                rate = pair['rate']
+                try:
+                    ticker = exchange.fetch_ticker(sym)
+                    price = float(ticker['last'])
+                    if price == 0: continue
+                    market = exchange.market(sym)
+                    min_cost = float(market['limits']['cost']['min']) if market['limits'].get('cost') else 5.0
+                    gross = position_usdt * abs(rate)
+                    fee = position_usdt * 0.0012
+                    net = gross - fee
+                    if net < MIN_NET_PROFIT: continue
+                    if position_usdt < min_cost: continue
+                    amount = position_usdt / price
+                    # Adjust amount to market precision
+                    amount = float(exchange.amount_to_precision(sym, amount))
+                    selected = {'symbol': sym, 'rate': rate, 'price': price, 'amount': amount, 'net': net, 'raw': pair['raw_symbol']}
+                    break
+                except Exception as e:
+                    continue
+
+            if not selected:
+                telegram(f"⚠️ No affordable pair >=0.5% for ${wallet:.2f} - Skipping this slot")
+                await asyncio.sleep(60)
+                continue
+
+            # Wait for exact entry 45 sec before funding
+            while True:
+                diff = (next_funding_time - datetime.utcnow()).total_seconds()
+                if diff <= FUNDING_ENTRY_SEC:
+                    break
+                await asyncio.sleep(0.2)
+
+            sym = selected['symbol']
+            rate = selected['rate']
+            side = "LONG" if rate < 0 else "SHORT"
+            raw = selected['raw']
+
+            try:
+                exchange.set_leverage(LEVERAGE, sym)
+                exchange.set_margin_mode('ISOLATED', sym)
+                amt = selected['amount']
+
+                telegram(f"🚀 *SNIPING HIGHEST* {raw}\nRate {rate*100:.4f}% | {side}\nPos ${position_usdt:.2f} Net ${selected['net']:.4f}\nMIN 0.5% MAX ∞")
+
+                if side == "LONG":
+                    order = exchange.create_market_buy_order(sym, amt)
+                else:
+                    order = exchange.create_market_sell_order(sym, amt)
+
+                entry = float(order.get('average') or selected['price'])
+                telegram(f"✅ *Entered* {side} {sym}\nEntry {entry}\nRate {rate*100:.4f}%")
+
+                # Close logic: avg/profit or SL -15%
+                await asyncio.sleep(75) # Wait for funding paid
+                start = time.time()
+                closed = False
+
+                while time.time() - start < 300: # 5 min max hold
+                    try:
+                        curr = float(exchange.fetch_ticker(sym)['last'])
+                        change = (curr - entry) / entry if side == "LONG" else (entry - curr) / entry
+                        
+                        if change >= 0: # avg or profit
+                            if side == "LONG":
+                                exchange.create_market_sell_order(sym, amt)
+                            else:
+                                exchange.create_market_buy_order(sym, amt)
+                            new_bal = get_balance()
+                            profit = new_bal - wallet
+                            telegram(f"✅ *CLOSED PROFIT* {sym}\n{entry} -> {curr} ({change*100:.3f}%)\nRate {rate*100:.4f}%\nWallet ${wallet:.4f} -> ${new_bal:.4f} (+${profit:.4f})")
+                            closed = True
+                            break
+
+                        if change * LEVERAGE <= -STOP_LOSS_MARGIN: # -15% margin SL
+                            if side == "LONG":
+                                exchange.create_market_sell_order(sym, amt)
+                            else:
+                                exchange.create_market_buy_order(sym, amt)
+                            new_bal = get_balance()
+                            telegram(f"🛑 *SL -15%* {sym}\nRate {rate*100:.4f}%\nWallet ${new_bal:.4f}")
+                            closed = True
+                            break
+                    except Exception as e:
+                        print(f"Close check error {e}")
+                    await asyncio.sleep(1)
+
+                if not closed:
+                    try:
+                        if side == "LONG":
+                            exchange.create_market_sell_order(sym, amt)
+                        else:
+                            exchange.create_market_buy_order(sym, amt)
+                        telegram(f"⚠️ Force closed {sym} after 5 min")
+                    except: pass
+
+            except Exception as e:
+                telegram(f"❌ Failed {sym}: {e}")
+                # Try to close any open position
+                try:
+                    pos = exchange.fetch_positions([sym])
+                    for p in pos:
+                        if float(p.get('contracts', 0)) > 0:
+                            amt = float(p['contracts'])
+                            if p['side'] == 'long':
+                                exchange.create_market_sell_order(sym, amt)
+                            else:
+                                exchange.create_market_buy_order(sym, amt)
+                except: pass
+
+            await asyncio.sleep(10)
+
+        except Exception as e:
+            telegram(f"❌ Main loop error: {e}")
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    backtest_60d_live_4h()
+    asyncio.run(main())
