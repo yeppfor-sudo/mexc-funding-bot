@@ -16,14 +16,22 @@ jobs:
           def get_hist(s):
               try:
                   r=requests.get(f"{BASE}/funding_rate/history", params={"symbol":s}, timeout=10).json()
-                  return r.get("data") or []
+                  d=r.get("data")
+                  if not d: return []
+                  if isinstance(d, dict): return [d]
+                  return d
               except: return []
           detail=requests.get(f"{BASE}/detail", timeout=15).json().get("data") or []
           syms=[d["symbol"] for d in detail if "_USDT" in d["symbol"]][:300]
           wallet=1000.0; trades=0; killer=0; profit=0
+          print(f"Scanning {len(syms)} symbols...")
           for sym in syms:
               hist=get_hist(sym)
-              for e in hist[-30:]:
+              if not hist: 
+                  time.sleep(0.02)
+                  continue
+              last30 = hist[-30:] if len(hist)>=30 else hist
+              for e in last30:
                   try:
                       rate=float(e.get("fundingRate",0))
                       if abs(rate)>=0.005:
@@ -33,11 +41,12 @@ jobs:
                           if trades%30==0:
                               profit-=notional/5*0.25; killer+=1
                   except: pass
-              time.sleep(0.05)
+              time.sleep(0.03)
           print(f"\n=== 30D ESTIMATE ===")
           print(f"Trades >=0.5%: {trades}")
           print(f"Killer hits: {killer}")
           print(f"Profit: ${profit:.2f}")
           print(f"Start $1000 -> ${1000+profit:.2f}")
+          print(f"Rule: 45s before, 3s after, 99%*5x, killer -5% price")
           PY
       - run: python backtest_30d.py
