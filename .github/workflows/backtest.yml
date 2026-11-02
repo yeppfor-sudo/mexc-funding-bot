@@ -22,28 +22,32 @@ jobs:
                   return d
               except: return []
           detail=requests.get(f"{BASE}/detail", timeout=15).json().get("data") or []
-          syms=[d["symbol"] for d in detail if "_USDT" in d["symbol"]][:300]
-          wallet=1000.0; trades=0; killer=0; profit=0
-          print(f"Scanning {len(syms)} symbols...")
-          for sym in syms:
+          syms=[d["symbol"] for d in detail if "_USDT" in d["symbol"]]  # ALL, no limit
+          print(f"Scanning ALL {len(syms)} perps...")
+          wallet=1000.0; trades=0; killer=0; profit=0; found=[]
+          for i,sym in enumerate(syms):
               hist=get_hist(sym)
               if not hist: 
-                  time.sleep(0.02)
+                  time.sleep(0.01)
                   continue
-              last30 = hist[-30:] if len(hist)>=30 else hist
-              for e in last30:
+              for e in hist[-30:]:
                   try:
                       rate=float(e.get("fundingRate",0))
-                      if abs(rate)>=0.005:
+                      if abs(rate)>=0.005:  # 0.5% -> INF
                           notional=wallet*0.99*5/3
                           pnl=notional*abs(rate)*0.75
                           profit+=pnl; trades+=1
+                          found.append((sym, rate))
                           if trades%30==0:
                               profit-=notional/5*0.25; killer+=1
                   except: pass
-              time.sleep(0.03)
-          print(f"\n=== 30D ESTIMATE ===")
+              if i%200==0:
+                  print(f"{i}/{len(syms)} checked... found {trades} trades")
+              time.sleep(0.02)
+          print(f"\n=== 30D ALL COINS ===")
+          print(f"Total perps scanned: {len(syms)}")
           print(f"Trades >=0.5%: {trades}")
+          print(f"Top coins: {sorted(found, key=lambda x: -abs(x[1]))[:10]}")
           print(f"Killer hits: {killer}")
           print(f"Profit: ${profit:.2f}")
           print(f"Start $1000 -> ${1000+profit:.2f}")
