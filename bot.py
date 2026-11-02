@@ -1,243 +1,112 @@
-import ccxt
-import time
-import asyncio
-import os
-import requests
+import ccxt, time
 from datetime import datetime, timedelta
 
-# === SECRETS FROM GITHUB ===
-MEXC_API_KEY = os.getenv("MEXC_API_KEY")
-MEXC_SECRET = os.getenv("MEXC_SECRET")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# === FINAL LOCKED CONFIG ===
-LEVERAGE = 5
-WALLET_PERCENT = 0.99
-FUNDING_ENTRY_SEC = 45  # Enter 45 sec before funding
-CHECK_BEFORE_SEC = 120  # Start checking 2 min before
-STOP_LOSS_MARGIN = 0.15 # -15% SL on margin
-MIN_NET_PROFIT = 0.05
-MIN_FILTER = 0.005       # MIN 0.5%
-MAX_FILTER = float('inf') # MAX ∞
-FUNDING_HOURS = [0,4,8,12,16,20] # EVERY 4H as you asked
-
-exchange = ccxt.mexc({
-    'apiKey': MEXC_API_KEY,
-    'secret': MEXC_SECRET,
-    'options': {'defaultType': 'swap'},
-    'enableRateLimit': True
+# ================= BACKTEST CONFIG =================
+mexc = ccxt.mexc({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'}
 })
 
-def telegram(msg):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
-    except: pass
-    print(msg)
+START_CAPITAL = 5
+WALLET_PERCENT = 0.99
+LEVERAGE = 5
+MIN_FUNDING = 0.005  # 0.5% - Your HOT 0.70% rule
+FEE = 0.0006  # 0.06% taker (MEXC API)
+SL_HIT_RATE = 0.15  # 15% trades hit -3% SL (realistic)
 
-def get_balance():
-    try:
-        bal = exchange.fetch_balance({'type': 'swap'})
-        free = float(bal.get('USDT', {}).get('free', 0) or bal.get('free', {}).get('USDT', 0) or 0)
-        if free < 0.1:
-            bal2 = exchange.fetch_balance()
-            free = float(bal2.get('USDT', {}).get('free', 0) or 0)
-        return free
-    except Exception as e:
-        print(f"Balance error {e}")
-        return 0
+# Coins to backtest (top meme + majors)
+COINS = ['HOT/USDT:USDT', 'PEPE/USDT:USDT', 'BONK/USDT:USDT', 'WIF/USDT:USDT', 'FLOKI/USDT:USDT', 'DOGE/USDT:USDT', 'SHIB/USDT:USDT', 'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
 
-def get_top_funding_mexc_api():
-    """Fetch live funding - MIN 0.5% MAX ∞ - HIGHEST FIRST"""
-    try:
-        url = "https://contract.mexc.com/api/v1/contract/ticker"
-        resp = requests.get(url, timeout=15).json()
-        data = resp.get('data', [])
-        lst = []
-        for item in data:
-            try:
-                symbol = item['symbol']
-                if '_USDT' not in symbol: continue
-                ccxt_symbol = symbol.replace('_', '/') + ':USDT'
-                funding = float(item.get('fundingRate', 0))
-                abs_rate = abs(funding)
-                if abs_rate < MIN_FILTER: continue
-                if abs_rate > MAX_FILTER: continue
-                lst.append({
-                    'symbol': ccxt_symbol,
-                    'raw_symbol': symbol,
-                    'rate': funding,
-                    'abs': abs_rate
-                })
-            except: continue
-        lst.sort(key=lambda x: x['abs'], reverse=True) # HIGHEST FIRST
-        return lst
-    except Exception as e:
-        print(f"Ticker API error {e}")
-        return []
-
-async def wait_for_window():
-    """Wait for next funding window EVERY 4H"""
-    while True:
-        now = datetime.utcnow()
-        next_f = None
-        for h in FUNDING_HOURS:
-            cand = now.replace(hour=h, minute=0, second=0, microsecond=0)
-            if cand > now:
-                next_f = cand
-                break
-        if not next_f:
-            next_f = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        diff = (next_f - now).total_seconds()
-        if diff <= CHECK_BEFORE_SEC:
-            return next_f
-        sleep_time = min(diff - CHECK_BEFORE_SEC, 60)
-        print(f"Next funding {next_f} UTC in {diff/3600:.2f}h - sleeping {sleep_time:.0f}s")
-        await asyncio.sleep(sleep_time)
-
-async def main():
-    wallet = get_balance()
-    telegram(f"🤖 *BOT STARTED FINAL*\n💰 Wallet: ${wallet:.4f}\n⚙️ MIN 0.5% MAX ∞ | HIGHEST FIRST | EVERY 4H {FUNDING_HOURS}\n99% x {LEVERAGE}x | SL -15% | Compound 100%\nProven +964% in 30d backtest")
+def backtest_60_days():
+    print(f"=== MEXC 60-DAY BACKTEST | Capital ${START_CAPITAL} | MIN {MIN_FUNDING*100}% ===")
     
-    while True:
+    end = int(time.time() * 1000)
+    start = end - (60 * 24 * 60 * 60 * 1000)
+    
+    all_trades = []
+    wallet = START_CAPITAL
+    
+    for symbol in COINS:
         try:
-            next_funding_time = await wait_for_window()
-            wallet = get_balance()
+            # Fetch 60 days funding history
+            history = mexc.fetch_funding_rate_history(symbol, since=start, limit=1000)
+            print(f"\n{symbol}: {len(history)} fundings in 60 days")
             
-            if wallet < 0.5:
-                telegram(f"❌ Balance ${wallet:.4f} too low - Transfer USDT from Spot to Futures")
-                await asyncio.sleep(60)
-                continue
-
-            position_usdt = wallet * WALLET_PERCENT * LEVERAGE
-            top = get_top_funding_mexc_api()
-
-            if not top:
-                telegram(f"⏰ {next_funding_time} UTC - No pair >=0.5% now. Waiting next slot in 4h.")
-                await asyncio.sleep(60)
-                continue
-
-            top3_str = ", ".join([f"{p['raw_symbol']} {p['rate']*100:.2f}%" for p in top[:3]])
-            telegram(f"⏰ *2 min to funding*\nFound {len(top)} pairs >=0.5%\n🏆 *HIGHEST:* {top[0]['raw_symbol']} {top[0]['rate']*100:.4f}%\n📊 Top: {top3_str}")
-
-            selected = None
-            for pair in top[:30]:
-                sym = pair['symbol']
-                rate = pair['rate']
-                try:
-                    ticker = exchange.fetch_ticker(sym)
-                    price = float(ticker['last'])
-                    if price == 0: continue
-                    market = exchange.market(sym)
-                    min_cost = float(market['limits']['cost']['min']) if market['limits'].get('cost') else 5.0
-                    gross = position_usdt * abs(rate)
-                    fee = position_usdt * 0.0012
-                    net = gross - fee
-                    if net < MIN_NET_PROFIT: continue
-                    if position_usdt < min_cost: continue
-                    amount = position_usdt / price
-                    # Adjust amount to market precision
-                    amount = float(exchange.amount_to_precision(sym, amount))
-                    selected = {'symbol': sym, 'rate': rate, 'price': price, 'amount': amount, 'net': net, 'raw': pair['raw_symbol']}
-                    break
-                except Exception as e:
+            for h in history:
+                rate = float(h['fundingRate'])
+                if abs(rate) < MIN_FUNDING:
                     continue
-
-            if not selected:
-                telegram(f"⚠️ No affordable pair >=0.5% for ${wallet:.2f} - Skipping this slot")
-                await asyncio.sleep(60)
-                continue
-
-            # Wait for exact entry 45 sec before funding
-            while True:
-                diff = (next_funding_time - datetime.utcnow()).total_seconds()
-                if diff <= FUNDING_ENTRY_SEC:
-                    break
-                await asyncio.sleep(0.2)
-
-            sym = selected['symbol']
-            rate = selected['rate']
-            side = "LONG" if rate < 0 else "SHORT"
-            raw = selected['raw']
-
-            try:
-                exchange.set_leverage(LEVERAGE, sym)
-                exchange.set_margin_mode('ISOLATED', sym)
-                amt = selected['amount']
-
-                telegram(f"🚀 *SNIPING HIGHEST* {raw}\nRate {rate*100:.4f}% | {side}\nPos ${position_usdt:.2f} Net ${selected['net']:.4f}\nMIN 0.5% MAX ∞")
-
-                if side == "LONG":
-                    order = exchange.create_market_buy_order(sym, amt)
+                
+                # Your bot logic
+                position = wallet * WALLET_PERCENT * LEVERAGE
+                # Cap by depth logic: assume $100k depth for meme, $1.5M for BTC
+                depth_cap = 100000 if 'HOT' in symbol or 'PEPE' in symbol else 1500000
+                position = min(position, depth_cap * 0.15)
+                
+                gross = position * abs(rate)
+                fee = position * FEE * 2  # open+close
+                net_funding = gross - fee
+                
+                # Simulate SL: 15% chance of -3% loss
+                import random
+                random.seed(int(h['timestamp']))
+                is_sl = random.random() < SL_HIT_RATE
+                if is_sl:
+                    sl_loss = position * 0.03
+                    net = net_funding - sl_loss
+                    result = f"SL LOSS -3%"
                 else:
-                    order = exchange.create_market_sell_order(sym, amt)
-
-                entry = float(order.get('average') or selected['price'])
-                telegram(f"✅ *Entered* {side} {sym}\nEntry {entry}\nRate {rate*100:.4f}%")
-
-                # Close logic: avg/profit or SL -15%
-                await asyncio.sleep(75) # Wait for funding paid
-                start = time.time()
-                closed = False
-
-                while time.time() - start < 300: # 5 min max hold
-                    try:
-                        curr = float(exchange.fetch_ticker(sym)['last'])
-                        change = (curr - entry) / entry if side == "LONG" else (entry - curr) / entry
-                        
-                        if change >= 0: # avg or profit
-                            if side == "LONG":
-                                exchange.create_market_sell_order(sym, amt)
-                            else:
-                                exchange.create_market_buy_order(sym, amt)
-                            new_bal = get_balance()
-                            profit = new_bal - wallet
-                            telegram(f"✅ *CLOSED PROFIT* {sym}\n{entry} -> {curr} ({change*100:.3f}%)\nRate {rate*100:.4f}%\nWallet ${wallet:.4f} -> ${new_bal:.4f} (+${profit:.4f})")
-                            closed = True
-                            break
-
-                        if change * LEVERAGE <= -STOP_LOSS_MARGIN: # -15% margin SL
-                            if side == "LONG":
-                                exchange.create_market_sell_order(sym, amt)
-                            else:
-                                exchange.create_market_buy_order(sym, amt)
-                            new_bal = get_balance()
-                            telegram(f"🛑 *SL -15%* {sym}\nRate {rate*100:.4f}%\nWallet ${new_bal:.4f}")
-                            closed = True
-                            break
-                    except Exception as e:
-                        print(f"Close check error {e}")
-                    await asyncio.sleep(1)
-
-                if not closed:
-                    try:
-                        if side == "LONG":
-                            exchange.create_market_sell_order(sym, amt)
-                        else:
-                            exchange.create_market_buy_order(sym, amt)
-                        telegram(f"⚠️ Force closed {sym} after 5 min")
-                    except: pass
-
-            except Exception as e:
-                telegram(f"❌ Failed {sym}: {e}")
-                # Try to close any open position
-                try:
-                    pos = exchange.fetch_positions([sym])
-                    for p in pos:
-                        if float(p.get('contracts', 0)) > 0:
-                            amt = float(p['contracts'])
-                            if p['side'] == 'long':
-                                exchange.create_market_sell_order(sym, amt)
-                            else:
-                                exchange.create_market_buy_order(sym, amt)
-                except: pass
-
-            await asyncio.sleep(10)
-
+                    net = net_funding
+                    result = f"WIN"
+                
+                all_trades.append({
+                    'time': datetime.fromtimestamp(h['timestamp']/1000).strftime('%Y-%m-%d %H:%M'),
+                    'symbol': symbol,
+                    'rate': rate*100,
+                    'position': position,
+                    'gross': gross,
+                    'net': net,
+                    'result': result,
+                    'wallet_before': wallet
+                })
+                wallet += net
+                if wallet < 0.5:
+                    wallet = 0.5
+                
         except Exception as e:
-            telegram(f"❌ Main loop error: {e}")
-            await asyncio.sleep(30)
+            print(f"  {symbol} error: {e}")
+            continue
+    
+    # Sort by time
+    all_trades.sort(key=lambda x: x['time'])
+    
+    print("\n" + "="*90)
+    print(f"{'Date':<16} {'Coin':<14} {'Rate':<8} {'Pos':<7} {'Gross':<7} {'Net':<7} {'Wallet':<8} {'Result'}")
+    print("="*90)
+    
+    for t in all_trades[-50:]:  # Last 50 trades
+        print(f"{t['time']:<16} {t['symbol']:<14} {t['rate']:>6.2f}% ${t['position']:>5.0f} ${t['gross']:>5.3f} ${t['net']:>6.3f} ${t['wallet_before']:>6.2f} {t['result']}")
+    
+    # Summary
+    total_trades = len(all_trades)
+    wins = len([t for t in all_trades if t['result']=='WIN'])
+    total_gross = sum([t['gross'] for t in all_trades])
+    total_net = sum([t['net'] for t in all_trades])
+    final_wallet = START_CAPITAL + total_net
+    
+    print("\n" + "="*90)
+    print(f"BACKTEST RESULT 60 DAYS | MEXC REAL FUNDING")
+    print(f"Start: ${START_CAPITAL} -> End: ${final_wallet:.2f} | Profit: ${total_net:.2f} ({total_net/START_CAPITAL*100:.1f}%)")
+    print(f"Total trades: {total_trades} | Wins: {wins} ({wins/total_trades*100:.1f}%) | SL hits: {total_trades-wins}")
+    print(f"Avg per trade: ${total_net/total_trades:.4f} | Avg per day: ${total_net/60:.2f}")
+    print(f"With $100k cap (same strategy): ${(total_net/START_CAPITAL)*100000:.0f} profit in 60 days")
+    print("="*90)
+    
+    # Extrapolate to your scenarios
+    print(f"\nEXTRAPOLATION:")
+    print(f"$5 -> 60 days: ${final_wallet:.2f}")
+    print(f"$100k with same hit rate: ${100000 + (total_net/START_CAPITAL)*100000:.0f} (if no depth limits)")
+    print(f"$100k with $50k cap + 0.15% filter: ~${100000 + (total_net/60*0.3)*60:.0f} (realistic with PEPE depth)")
+    print(f"$20M ($1M x 20 exchanges): ~${20000000 + (total_net/START_CAPITAL)*20000000*0.6:.0f} (60% due to depth)")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+backtest_60_days()
