@@ -213,6 +213,15 @@ def hold(c, entry, amt, slot, wallet):
 def main():
     exchange.load_markets()
     slot = next_slot()
+    if os.getenv("TEST_SCAN") == "1":                 # test mode: scan now, never trade
+        wallet = balance()
+        valid = scan(slot)
+        ranked = rank(valid, wallet * WALLET_PCT * LEVERAGE)
+        tg(f"TEST SCAN | wallet ${wallet:.4f} | next slot {datetime.fromtimestamp(slot, timezone.utc):%H:%M} UTC\n"
+           f"{len(valid)} pairs pass rate+4h-cycle filters, {len(ranked)} also pass liquidity/edge\n" +
+           "\n".join(f"{c['raw']} {c['rate']*100:.3f}% {c['side']} edge {c['edge']*100:.2f}%"
+                     for c in ranked[:5]))
+        return
     if slot - time.time() > MAX_WAIT:
         tg("Next slot too far away, exiting.")
         return
