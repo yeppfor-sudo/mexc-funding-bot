@@ -1,28 +1,11 @@
-name: bot
-on:
-  schedule:
-    - cron: '*/10 * * * *'
-  workflow_dispatch:
-concurrency:
-  group: funding-bot-main
-  cancel-in-progress: false
+name: backtest
+on: workflow_dispatch
 jobs:
-  run:
+  backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        with: { python-version: '3.11' }
       - run: pip install ccxt requests
-      - name: Run
-        run: python bot.py
-        env:
-          MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
-          MEXC_SECRET: ${{ secrets.MEXC_SECRET }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          LIVE: ${{ secrets.LIVE }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          GH_REPO: ${{ github.repository }}
+      - run: python backtest_30d.py
