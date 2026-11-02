@@ -1,33 +1,18 @@
-name: funding-keeper
-
+name: keeper
 on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
-
-permissions:
-  actions: write
-  contents: read
-
 jobs:
-  keep:
+  keeper:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
     steps:
-      - name: Start the bot if no run is active or queued
+      - name: Auto restart
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          LIVE: ${{ vars.LIVE || '0' }}
         run: |
-          active=$(gh run list --workflow funding-bot.yml --limit 20 --json status \
-            --jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending")] | length')
-          echo "active bot runs: $active"
-          if [ "$active" = "0" ]; then
-            echo "no active run - starting bot"
-            if [ "$LIVE" = "1" ]; then
-              gh workflow run funding-bot.yml -f live=1
-            else
-              gh workflow run funding-bot.yml
-            fi
+          RUNS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/$GH_REPO/actions/workflows/bot.yml/runs?per_page=5" | grep -c '"status": "in_progress"' || true)
+          if [ "$RUNS" = "0" ]; then
+            curl -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/$GH_REPO/actions/workflows/bot.yml/dispatches" -d '{"ref":"main"}'
           fi
