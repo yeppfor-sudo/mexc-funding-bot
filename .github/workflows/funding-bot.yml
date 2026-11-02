@@ -1,0 +1,39 @@
+name: funding-bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      live:
+        description: 'Type 1 for real trading (blank = use repo variable LIVE, default dry run)'
+        required: false
+        default: ''
+
+# only one bot run at a time; the next run waits in the queue until this one ends
+concurrency:
+  group: funding-bot
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install ccxt requests
+      - run: python bot.py
+        env:
+          MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
+          MEXC_SECRET: ${{ secrets.MEXC_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LIVE: ${{ github.event.inputs.live || vars.LIVE || '0' }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
