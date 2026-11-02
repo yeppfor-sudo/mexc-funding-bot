@@ -1,0 +1,33 @@
+name: funding-bot
+
+on:
+  schedule:
+    # starts 40 min before each 4h funding slot (00,04,08,12,16,20 UTC); bot sleeps until T-2min
+    - cron: '20 23,3,7,11,15,19 * * *'
+  workflow_dispatch:
+    inputs:
+      live:
+        description: 'Set 1 for real trading, 0 for dry run'
+        default: '0'
+
+concurrency:
+  group: funding-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install ccxt requests
+      - run: python bot.py
+        env:
+          MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
+          MEXC_SECRET: ${{ secrets.MEXC_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LIVE: ${{ github.event.inputs.live || vars.LIVE || '0' }}
