@@ -1,18 +1,16 @@
 name: keeper
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/20 * * * *'
   workflow_dispatch:
 jobs:
-  keeper:
+  keep:
     runs-on: ubuntu-latest
     steps:
-      - name: Auto restart
+      - uses: actions/checkout@v4
+      - name: Keep alive
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          GH_REPO: ${{ github.repository }}
+          GH_REPO: ${{ secrets.GH_REPO }}
         run: |
-          RUNS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/$GH_REPO/actions/workflows/bot.yml/runs?per_page=5" | grep -c '"status": "in_progress"' || true)
-          if [ "$RUNS" = "0" ]; then
-            curl -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/$GH_REPO/actions/workflows/bot.yml/dispatches" -d '{"ref":"main"}'
-          fi
+          gh workflow run funding.yml --repo $GH_REPO || true
