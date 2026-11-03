@@ -35,13 +35,20 @@ def get_wallet():
 def get_funding_opportunities():
     try:
         exchange.load_markets()
-        tickers = exchange.fetch_funding_rates()
         ops = []
-        for symbol, data in tickers.items():
-            rate = data.get('fundingRate', 0)
-            if rate is not None and rate <= -0.005:  # -0.5% or better (shorts get paid)
-                ops.append((symbol, rate))
+        symbols = [s for s in exchange.markets if ':USDT' in s][:50]
+        for symbol in symbols:
+            try:
+                data = exchange.fetch_funding_rate(symbol)
+                rate = data.get('fundingRate')
+                if rate is not None and rate <= -0.005:
+                    ops.append((symbol, rate))
+                    print(f"FOUND {symbol} {rate*100:.4f}%", flush=True)
+                time.sleep(0.3)
+            except:
+                continue
         ops.sort(key=lambda x: x[1])
+        print(f"Scanned {len(symbols)} markets, found {len(ops)} good", flush=True)
         return ops[:5]
     except Exception as e:
         print(f"Funding fetch error: {e}", flush=True)
@@ -49,63 +56,37 @@ def get_funding_opportunities():
 
 def trade_loop():
     wallet = get_wallet()
-    if wallet < 1:
-        print("Wallet < $1 - need to deposit to Futures!", flush=True)
-        print("Go MEXC -> Futures -> Transfer from Spot to Futures", flush=True)
-
     while True:
         now = datetime.now(timezone.utc)
-        # Next funding times are 00:00, 08:00, 16:00 UTC
-        funding_hours = [0,8,16]
-        next_hour = min([h for h in funding_hours if h > now.hour] + [24+funding_hours[0]])
-        next_time = now.replace(hour=next_hour%24, minute=0, second=0, microsecond=0)
-        if next_hour >=24:
-            next_time = next_time.replace(day=now.day+1)
-
-        mins_to = (next_time - now).total_seconds()/60
-        print(f"\n[{now.strftime('%H:%M:%S')} UTC] Next funding {next_time.strftime('%H:%M')} UTC in {mins_to:.1f} min", flush=True)
+        mins_to_16 = ((16 - now.hour) % 24)*60 - now.minute
+        if mins_to_16 < 0:
+            mins_to_16 += 24*60
+        print(f"\n[{now.strftime('%H:%M:%S')} UTC] Next funding 16:00 UTC in {mins_to_16:.1f} min", flush=True)
         
         ops = get_funding_opportunities()
-        if ops:
-            print(f"Found {len(ops)} ops: {ops}", flush=True)
-        else:
+        if not ops:
             print("No high funding yet (< -0.5%) - scanning...", flush=True)
+        else:
+            print(f"Best: {ops[0]}", flush=True)
 
-        # If within 5 min before funding, enter
-        if mins_to <= 5 and mins_to > 0 and ops and LIVE:
+        if mins_to_16 <= 5 and mins_to_16 > 0 and ops and LIVE:
             symbol, rate = ops[0]
             try:
-                print(f"TRADE: Short {symbol} rate {rate*100:.3f}% with 3x", flush=True)
-                # Close all first
-                try:
-                    positions = exchange.fetch_positions()
-                    for p in positions:
-                        if float(p.get('contracts',0))>0:
-                            exchange.create_order(p['symbol'], 'market', 'buy' if p['side']=='short' else 'sell', p['contracts'])
-                except: pass
-
-                bal = wallet * 0.99
-                markets = exchange.markets[symbol]
+                print(f"TRADE NOW: Short {symbol} {rate*100:.3f}%", flush=True)
                 price = exchange.fetch_ticker(symbol)['last']
+                bal = wallet * 0.99
                 amount = (bal * 3) / price
-                # round amount
                 amount = float(exchange.amount_to_precision(symbol, amount))
-                if amount>0:
-                    order = exchange.create_market_sell_order(symbol, amount)
-                    print(f"OPENED short {symbol} {amount} @ {price} Order {order.get('id')}", flush=True)
-                    # Wait for funding
-                    sleep_sec = (mins_to*60)+90
-                    print(f"Holding {sleep_sec/60:.1f} min to collect funding...", flush=True)
-                    time.sleep(sleep_sec)
-                    # Close
-                    exchange.create_market_buy_order(symbol, amount)
-                    print(f"CLOSED - Funding collected! New wallet:", flush=True)
-                    get_wallet()
+                print(f"Amount {amount} @ {price}", flush=True)
+                exchange.create_market_sell_order(symbol, amount)
+                print("OPENED - waiting 90s for funding", flush=True)
+                time.sleep(90)
+                exchange.create_market_buy_order(symbol, amount)
+                print("CLOSED - Funding collected!", flush=True)
+                get_wallet()
             except Exception as e:
                 print(f"Trade error: {e}", flush=True)
 
-        # Killer check: if price moved 2% against us, exit
         time.sleep(30)
 
-if __name__ == "__main__":
-    trade_loop()
+trade_loop()
