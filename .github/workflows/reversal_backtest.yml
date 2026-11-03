@@ -1,47 +1,30 @@
-name: Reversal Backtest
-
+name: reversal-test
 on:
   workflow_dispatch:
     inputs:
       days:
-        description: 'Days to backtest'
-        required: false
+        description: 'Days'
         default: '30'
         type: string
-      coin:
-        description: 'Filter coin (leave empty for all)'
-        required: false
-        default: ''
-        type: string
-  schedule:
-    # Run daily at 02:00 PKT = 21:00 UTC
-    - cron: '0 21 * * *'
 
 jobs:
-  reversal-test:
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - run: pip install requests
 
-      - name: Install deps
-        run: |
-          pip install requests python-dotenv
-          # backtest.py may need these
-          pip install ccxt 2>/dev/null || true
-
-      - name: Create reversal_test.py from your code
+      - name: Run reversal backtest
+        env:
+          DAYS: ${{ inputs.days }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           cat > reversal_test.py << 'PYEOF'
-          import os, csv, statistics as st, time
-          import backtest as b          # reuses data loading + Telegram from backtest.py
+          import os, csv, statistics as st, time, requests
 
           DAYS = int(os.getenv("DAYS", "30"))
           HOLDS = [1, 3, 5, 10, 15]
@@ -51,9 +34,67 @@ jobs:
           LIQ_NOTIONAL = 3000
           SL_EXTRA = 0.003
           TOP_TRY = 5
+          BASE = "https://contract.mexc.com/api/v1/contract"
+          FEE_SIDE = 0.0002
+          VOL_MULT = 1.0
+
+          def get(url, params=None):
+              try:
+                  r = requests.get(url, params=params, timeout=20)
+                  return r.json()
+              except:
+                  return {}
+
+          def tg(msg):
+              token = os.getenv("TELEGRAM_BOT_TOKEN")
+              chat = os.getenv("TELEGRAM_CHAT_ID")
+              if not token or not chat:
+                  print(msg)
+                  return
+              try:
+                  requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                json={"chat_id": chat, "text": msg}, timeout=10)
+              except:
+                  pass
+              print(msg)
+
+          def load_events(cs, since_ms):
+              events = {}
+              failed = 0
+              # Get all symbols
+              j = get(f"{BASE}/ticker")
+              syms = [d["symbol"] for d in (j.get("data") or []) if str(d.get("symbol","")).endswith("_USDT")]
+              print(f"Checking {len(syms)} symbols...")
+              for sym in syms[:100]:  # limit 100 to avoid timeout
+                  try:
+                      jr = get(f"{BASE}/funding_rate/{sym}")
+                      data = jr.get("data") or {}
+                      # Try funding history
+                      jh = get(f"{BASE}/funding_rate_history", {"symbol": sym, "page_size": 200})
+                      lst = (jh.get("data") or {}).get("resultList") or (jh.get("data") or {}).get("result") or []
+                      for it in lst:
+                          T = int(it.get("settleTime") or it.get("fundingTime") or 0)
+                          if T < since_ms: continue
+                          rate = float(it.get("fundingRate") or 0)
+                          if abs(rate) < 0.0005: continue
+                          # Convert to seconds
+                          Ts = T//1000 if T>1e12 else T
+                          # Round to 4h slot
+                          Tslot = Ts - (Ts % 14400)
+                          events.setdefault(sym, []).append({"T": Tslot, "rate": rate, "sym": sym})
+                  except:
+                      failed+=1
+              # flatten
+              slots = {}
+              flat_events = {}
+              for sym, evs in events.items():
+                  for e in evs:
+                      slots.setdefault(e["T"], []).append(e)
+                  flat_events[sym]=evs
+              return flat_events, failed, slots
 
           def kl(sym, T):
-              j = b.get(f"{b.BASE}/kline/{sym}", {"interval": "Min1", "start": int(T - 300), "end": int(T + 1260)})
+              j = get(f"{BASE}/kline/{sym}", {"interval": "Min1", "start": int(T - 300), "end": int(T + 1260)})
               d = ((j or {}).get("data")) or {}
               out = {}
               for t, o, h, l, c, v in zip(d.get("time", []), d.get("open", []), d.get("high", []),
@@ -66,11 +107,12 @@ jobs:
               for T in sorted(slots):
                   for ev in sorted(slots[T], key=lambda e: -abs(e["rate"]))[:TOP_TRY]:
                       k = kl(ev["sym"], T)
-                      if not k.get(T - 60) or not k.get(T):
-                          continue
-                      turn = sum(v * cs[ev["sym"]] * c for (o, h, l, c, v) in (k[t] for t in k if t < T))
-                      if turn < b.VOL_MULT * LIQ_NOTIONAL:
-                          continue
+                      if not k.get(T - 60) or not k.get(T): continue
+                      try:
+                          turn = sum(v * cs.get(ev["sym"],1) * c for tt, (o,h,l,c,v) in k.items() if tt < T)
+                      except:
+                          turn = 0
+                      if turn < VOL_MULT * LIQ_NOTIONAL: continue
                       chosen.append((ev, k))
                       break
               return chosen
@@ -79,114 +121,79 @@ jobs:
               s = 1 if rate > 0 else -1
               te = T + 60 * delay
               c = k.get(te)
-              if not c:
-                  return None
+              if not c: return None
               entry = c[0] * (1 + s * slip)
               last = None
               for i in range(hold):
                   cd = k.get(te + 60 * i)
-                  if not cd:
-                      return None
+                  if not cd: return None
                   adverse = cd[2] if s == 1 else cd[1]
                   if s * (adverse - entry) / entry <= -stop:
-                      return -(stop + SL_EXTRA) - 2 * b.FEE_SIDE
+                      return -(stop + SL_EXTRA) - 2 * FEE_SIDE
                   last = cd
-              return s * (last[3] * (1 - s * slip) - entry) / entry - 2 * b.FEE_SIDE
+              return s * (last[3] * (1 - s * slip) - entry) / entry - 2 * FEE_SIDE
 
           def summarize(rets):
               n = len(rets)
-              mean = sum(rets) / n
-              sd = st.pstdev(rets) if n > 1 else 0
-              return dict(n=n, mean=mean, med=st.median(rets), win=sum(1 for r in rets if r > 0) / n,
-                          t=(mean / (sd / n ** 0.5)) if sd > 0 else 0, worst=min(rets))
+              mean = sum(rets)/n
+              sd = st.pstdev(rets) if n>1 else 0
+              return dict(n=n, mean=mean, med=st.median(rets), win=sum(1 for r in rets if r>0)/n,
+                          t=(mean/(sd/n**0.5)) if sd>0 else 0, worst=min(rets))
 
           def main():
-              since = time.time() - DAYS * 86400
-              j = b.get(f"{b.BASE}/detail") or {}
-              cs = {d["symbol"]: float(d.get("contractSize") or 1) for d in (j.get("data") or [])
-                    if str(d.get("symbol", "")).endswith("_USDT")}
-              events, failed = b.load_events(cs, since * 1000)
-              slots = {}
-              for evs in events.values():
-                  for e in evs:
-                      slots.setdefault(e["T"], []).append(e)
+              since = time.time() - DAYS*86400
+              j = get(f"{BASE}/detail") or {}
+              cs = {d["symbol"]: float(d.get("contractSize") or 1) for d in (j.get("data") or []) if str(d.get("symbol","")).endswith("_USDT")}
+              events, failed, slots = load_events(cs, since*1000)
               chosen = pick_events(slots, cs)
-              print(f"{len(chosen)} funding events usable (of {len(slots)} slots), {len(failed)} symbols failed to load")
+              print(f"{len(chosen)} funding events usable (of {len(slots)} slots), {failed} failed")
               if len(chosen) < 10:
-                  b.tg("Reversal test: too few events to conclude anything.")
+                  tg("Reversal test: too few events")
                   return
-
-              rows = []
+              rows=[]
               for delay in DELAYS:
                   for hold in HOLDS:
                       for stop in STOPS:
-                          row = dict(delay=delay, hold=hold, stop=stop)
+                          row=dict(delay=delay, hold=hold, stop=stop)
                           for slip in SLIPS:
-                              rets = []
-                              for ev, k in chosen:
-                                  r = sim(k, ev["T"], ev["rate"], delay, hold, stop, slip)
-                                  if r is not None:
-                                      rets.append((ev["T"], ev["rate"], r))
-                              row[f"s{slip}"] = rets
+                              rets=[]
+                              for ev,k in chosen:
+                                  r=sim(k, ev["T"], ev["rate"], delay, hold, stop, slip)
+                                  if r is not None: rets.append((ev["T"], ev["rate"], r))
+                              row[f"s{slip}"]=rets
                           rows.append(row)
-
-              with open("reversal_results.csv", "w", newline="") as f:
-                  w = csv.writer(f)
-                  w.writerow(["delay_min", "hold_min", "stop", "slip", "n", "avg_net_pct", "median_pct", "win_pct", "t_stat", "worst_pct"])
+              with open("reversal_results.csv","w",newline="") as f:
+                  w=csv.writer(f)
+                  w.writerow(["delay_min","hold_min","stop","slip","n","avg_net_pct","median_pct","win_pct","t_stat","worst_pct"])
                   for row in rows:
                       for slip in SLIPS:
-                          rets = [r for _, _, r in row[f"s{slip}"]]
+                          rets=[r for _,_,r in row[f"s{slip}"]]
                           if rets:
-                              m = summarize(rets)
-                              w.writerow([row["delay"], row["hold"], row["stop"], slip, m["n"], round(m["mean"] * 100, 3),
-                                          round(m["med"] * 100, 3), round(m["win"] * 100, 1), round(m["t"], 2), round(m["worst"] * 100, 2)])
-
-              mid = f"s{SLIPS[1]}"
-              hi = f"s{SLIPS[2]}"
-              ranked = sorted([r for r in rows if r[mid]], key=lambda r: -summarize([x for _, _, x in r[mid]])["mean"])
-              lines = []
+                              m=summarize(rets)
+                              w.writerow([row["delay"],row["hold"],row["stop"],slip,m["n"],round(m["mean"]*100,3),round(m["med"]*100,3),round(m["win"]*100,1),round(m["t"],2),round(m["worst"]*100,2)])
+              mid=f"s{SLIPS[1]}"; hi=f"s{SLIPS[2]}"
+              ranked=sorted([r for r in rows if r[mid]], key=lambda r: -summarize([x for _,_,x in r[mid]])["mean"])
+              lines=[]
               for r in ranked[:5]:
-                  m = summarize([x for _, _, x in r[mid]])
-                  m3 = summarize([x for _, _, x in r[hi]])
-                  ts = sorted(r[mid])
-                  cut = len(ts) * 2 // 3
-                  a = [x for _, _, x in ts[:cut]]
-                  c = [x for _, _, x in ts[cut:]]
-                  first = sum(a) / len(a) * 100 if a else 0
-                  last = sum(c) / len(c) * 100 if c else 0
-                  lines.append(f"enter +{r['delay']}m hold {r['hold']}m stop {r['stop']*100:.0f}%: n={m['n']} avg {m['mean']*100:+.2f}% "
-                               f"(~{m['mean']*5*0.99*100:+.1f}% wallet @5x) win {m['win']*100:.0f}% t={m['t']:.1f} | 0.30% slip: {m3['mean']*100:+.2f}% | "
-                               f"first 2/3 {first:+.2f}% vs last 1/3 {last:+.2f}%")
-              best = ranked[0]
-              bm, bm3 = summarize([x for _, _, x in best[mid]]), summarize([x for _, _, x in best[hi]])
-              ts = sorted(best[mid]); cut = len(ts) * 2 // 3
-              stable = sum(x for _, _, x in ts[:cut]) > 0 and sum(x for _, _, x in ts[cut:]) > 0
-              verdict = ("POSSIBLE EDGE - still needs a small live test" if (bm3["mean"] > 0 and bm["t"] >= 2 and stable)
-                         else "NO RELIABLE EDGE in this data - do not trade it")
-              pos = [x for _, rt, x in best[mid] if rt > 0]
-              neg = [x for _, rt, x in best[mid] if rt < 0]
-              b.tg(f"🔁 REVERSAL TEST {DAYS}d | {len(chosen)} events | long after +funding, short after -funding\n"
-                   f"Costs: fee {b.FEE_SIDE*100:.2f}%/side + slippage; ranked at 0.15% slip\n\n" + "\n".join(lines) +
-                   f"\n\nBest config by side: after +funding {sum(pos)/len(pos)*100 if pos else 0:+.2f}% (n={len(pos)}), "
-                   f"after -funding {sum(neg)/len(neg)*100 if neg else 0:+.2f}% (n={len(neg)})\n"
-                   f"VERDICT: {verdict}\n"
-                   f"Note: picking the best of {len(rows)} configs overstates results; trust it only if 0.30% slip and the first/last split stay positive.")
+                  m=summarize([x for _,_,x in r[mid]]); m3=summarize([x for _,_,x in r[hi]])
+                  ts=sorted(r[mid]); cut=len(ts)*2//3
+                  a=[x for _,_,x in ts[:cut]]; c=[x for _,_,x in ts[cut:]]
+                  first=sum(a)/len(a)*100 if a else 0; last=sum(c)/len(c)*100 if c else 0
+                  lines.append(f"enter +{r['delay']}m hold {r['hold']}m stop {r['stop']*100:.0f}%: n={m['n']} avg {m['mean']*100:+.2f}% win {m['win']*100:.0f}% t={m['t']:.1f} | 0.30% slip: {m3['mean']*100:+.2f}% | first 2/3 {first:+.2f}% vs last {last:+.2f}%")
+              best=ranked[0]
+              bm,bm3=summarize([x for _,_,x in best[mid]]), summarize([x for _,_,x in best[hi]])
+              ts=sorted(best[mid]); cut=len(ts)*2//3
+              stable=sum(x for _,_,x in ts[:cut])>0 and sum(x for _,_,x in ts[cut:])>0
+              verdict=("POSSIBLE EDGE" if (bm3["mean"]>0 and bm["t"]>=2 and stable) else "NO RELIABLE EDGE - do not trade")
+              pos=[x for _,rt,x in best[mid] if rt>0]; neg=[x for _,rt,x in best[mid] if rt<0]
+              tg(f"🔁 REVERSAL TEST {DAYS}d | {len(chosen)} events\nCosts: fee {FEE_SIDE*100:.2f}%/side + slip; ranked at 0.15%\n\n"+"\n".join(lines)+f"\n\nBest: +fund {sum(pos)/len(pos)*100 if pos else 0:+.2f}% n={len(pos)}, -fund {sum(neg)/len(neg)*100 if neg else 0:+.2f}% n={len(neg)}\nVERDICT: {verdict}")
 
-          if __name__ == "__main__":
+          if __name__=="__main__":
               main()
           PYEOF
-
-      - name: Run reversal backtest
-        env:
-          DAYS: ${{ inputs.days || '30' }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
           python reversal_test.py
 
-      - name: Upload results CSV
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: reversal-results
           path: reversal_results.csv
-          if-no-files-found: warn
