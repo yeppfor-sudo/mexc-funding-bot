@@ -5,7 +5,7 @@ import sys
 import requests
 from datetime import datetime, timezone, timedelta
 
-print("=== FINAL v17 - MIN +->0.5% / MAX ♾️ INFINITE + BEST BOOK ===", flush=True)
+print("=== FINAL v18 - FAST SCAN - NO STUCK - MIN 0.5% MAX INF ===", flush=True)
 
 API_KEY = os.getenv("MEXC_API_KEY")
 SECRET = os.getenv("MEXC_SECRET")
@@ -16,8 +16,7 @@ INVEST_PCT = 0.99
 SL_PCT = 3.0
 ENTRY_SEC = 45
 EXIT_SEC = 3
-MIN_FUNDING = 0.005  # MIN +->0.5%
-MAX_FUNDING = 999    # MAX ♾️ INFINITE - NO CAP
+MIN_FUNDING = 0.005
 MAX_SLIPPAGE_PCT = 0.5
 
 if not API_KEY:
@@ -27,7 +26,8 @@ if not API_KEY:
 exchange = ccxt.mexc({
     'apiKey': API_KEY, 'secret': SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'swap'}
+    'options': {'defaultType': 'swap'},
+    'timeout': 10000
 })
 
 def get_wallet():
@@ -38,15 +38,18 @@ def get_wallet():
         return float(usdt)
     except: return 0
 
-def check_orderbook(symbol, wallet_usdt, side, rate):
+def check_orderbook_fast(symbol, wallet_usdt, side, rate):
     try:
         want_pos_usdt = wallet_usdt * INVEST_PCT * LEVERAGE
         if want_pos_usdt < 5: want_pos_usdt = 5
-        ob = exchange.fetch_order_book(symbol, limit=50)
+        ob = exchange.fetch_order_book(symbol, limit=20)  # FAST 20 not 50
         bids = ob.get('bids', []); asks = ob.get('asks', [])
         if not bids or not asks: return False, 99, 0, -999
-        mid = exchange.fetch_ticker(symbol)['last']
+        
+        # USE BOOK MID - NO EXTRA TICKER CALL = 2X FASTER
+        mid = (float(bids[0][0]) + float(asks[0][0])) / 2 if bids and asks else 0
         if not mid: return False, 99, 0, -999
+        
         book = bids if side=="SHORT" else asks
         filled_usdt=0; filled_amt=0; w_sum=0
         for entry in book:
@@ -68,29 +71,29 @@ def check_orderbook(symbol, wallet_usdt, side, rate):
             slip=abs(avg-mid)/mid*100 if mid else 99
             max_fill=filled_usdt
         funding=want_pos_usdt*abs(rate)
-        slip_cost=want_pos_usdt*(slip/100)
-        fee=want_pos_usdt*0.0004
-        net=funding-slip_cost-fee
+        net=funding - want_pos_usdt*(slip/100) - want_pos_usdt*0.0004
         can=slip<=MAX_SLIPPAGE_PCT and filled_usdt>=want_pos_usdt*0.9 and net>0
         return can, slip, max_fill, net
-    except:
+    except Exception as e:
         return False,99,0,-999
 
 def get_all_funding_smart():
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC] Fetching funding rates...", flush=True)
     try:
-        r1 = requests.get("https://contract.mexc.com/api/v1/contract/funding_rate", timeout=15).json()
+        r1 = requests.get("https://contract.mexc.com/api/v1/contract/funding_rate", timeout=10).json()
         funding_list = r1.get('data', [])
-        r2 = requests.get("https://contract.mexc.com/api/v1/contract/detail", timeout=15).json()
+        print(f"Got {len(funding_list)} funding rates", flush=True)
+        r2 = requests.get("https://contract.mexc.com/api/v1/contract/detail", timeout=10).json()
         details = {item['symbol']: item for item in r2.get('data', [])}
+        print(f"Got {len(details)} details", flush=True)
+        
         ops=[]
         now=datetime.now(timezone.utc)
         for f in funding_list:
             sym=f.get('symbol','')
             if not sym.endswith('_USDT'): continue
             rate=float(f.get('fundingRate',0))
-            # MIN +->0.5% / MAX ♾️
             if abs(rate) < MIN_FUNDING: continue
-            if abs(rate) > MAX_FUNDING: continue  # Never hits, infinite
             det=details.get(sym,{})
             next_ms=det.get('nextFundingTime') or f.get('nextFundingTime') or 0
             interval=det.get('fundingInterval') or 8
@@ -114,8 +117,11 @@ def get_all_funding_smart():
             ccxt_sym=f"{base}/USDT:USDT"
             side="SHORT" if rate>0 else "LONG"
             ops.append({'symbol':ccxt_sym,'rate':rate,'abs_rate':abs(rate),'interval':interval,'next_dt':next_dt,'secs_to':secs,'side':side})
+        
         if not ops:
-            return [], f"0 with MIN +->{MIN_FUNDING*100}% MAX ♾️"
+            msg=f"Scanned {len(funding_list)} | 0 with MIN +->{MIN_FUNDING*100}% MAX INF -> MISS 1: LOW FUNDING"
+            print(msg, flush=True)
+            return [], msg
         
         ops_4h=[o for o in ops if o['interval']==4]
         ops_8h=[o for o in ops if o['interval']==8]
@@ -124,19 +130,19 @@ def get_all_funding_smart():
             min_secs=min(o['secs_to'] for o in ops)
             settling=[o for o in ops if o['secs_to'] <= min_secs+600]
             settling.sort(key=lambda x: x['abs_rate'], reverse=True)
-            rule_msg=f"Only one type | Next {min_secs/60:.0f}min | MIN +->{MIN_FUNDING*100}% MAX ♾️"
+            rule_msg=f"Next in {min_secs/60:.0f}min | {len(ops)} coins MIN 0.5% MAX INF"
         else:
             min_4h=min(o['secs_to'] for o in ops_4h)
             min_8h=min(o['secs_to'] for o in ops_8h)
             diff=abs(min_4h-min_8h)
             if diff <= 600:
-                rule_msg=f"RULE 2: SAME TIME 4H {min_4h/60:.0f}m 8H {min_8h/60:.0f}m -> HIGHEST MIN +->{MIN_FUNDING*100}% MAX ♾️"
+                rule_msg=f"RULE2 SAME TIME 4H {min_4h/60:.0f}m 8H {min_8h/60:.0f}m -> HIGHEST ALL"
                 min_secs=min(min_4h,min_8h)
                 settling=[o for o in ops if o['secs_to'] <= min_secs+600]
                 settling.sort(key=lambda x: x['abs_rate'], reverse=True)
             else:
                 if min_4h < min_8h:
-                    rule_msg=f"RULE 1: 4H sooner {min_4h/60:.0f}m vs 8H {min_8h/60:.0f}m -> Pick 4H HIGHEST MIN +->{MIN_FUNDING*100}% MAX ♾️"
+                    rule_msg=f"RULE1 4H sooner {min_4h/60:.0f}m vs 8H {min_8h/60:.0f}m -> Pick 4H HIGHEST"
                     settling=[o for o in ops_4h if o['secs_to'] <= min_4h+600]
                     settling.sort(key=lambda x: x['abs_rate'], reverse=True)
                 else:
@@ -145,32 +151,44 @@ def get_all_funding_smart():
                     settling.sort(key=lambda x: x['abs_rate'], reverse=True)
         
         wallet=get_wallet()
+        print(f"{rule_msg} | Scanned {len(funding_list)} | {len(ops)} coins MIN 0.5% MAX INF | Wallet ${wallet:.2f} Pos ${wallet*INVEST_PCT*LEVERAGE:.2f}", flush=True)
+        print(f"Top 5 funding: {', '.join([f'{o[\"symbol\"]} {o[\"rate\"]*100:+.2f}%' for o in settling[:5]])}", flush=True)
+        
         good=[]
-        for o in settling:
-            if len(good)>=20: break
-            can,slip,max_fill,net=check_orderbook(o['symbol'], wallet, o['side'], o['rate'])
+        print(f"Checking order book (fast, 10 coins max)...", flush=True)
+        for o in settling[:10]:  # ONLY 10 COINS = NO STUCK
+            can,slip,max_fill,net=check_orderbook_fast(o['symbol'], wallet, o['side'], o['rate'])
             o['slippage']=slip; o['max_fill']=max_fill; o['net_profit']=net; o['can_fill']=can
             if can:
+                print(f"  ✅ {o['symbol']} {o['rate']*100:+.3f}% {o['interval']}H {o['side']} Book ${max_fill:.0f} Slip {slip:.3f}% Net ${net:.3f}", flush=True)
                 good.append(o)
+            else:
+                print(f"  ❌ SKIP {o['symbol']} {o['rate']*100:+.3f}% Book ${max_fill:.0f} Slip {slip:.2f}%", flush=True)
         
-        return good, rule_msg
+        if good:
+            good.sort(key=lambda x: x['net_profit'], reverse=True)
+            best=good[0]
+            print(f"FINAL PICK: {best['symbol']} {best['rate']*100:+.3f}% {best['interval']}H {best['side']} Net ${best['net_profit']:.3f}", flush=True)
+            return good, rule_msg
+        else:
+            msg=f"No good book in top 10 | Wallet ${wallet:.2f} too big for books -> MISS 2: THIN BOOK"
+            print(msg, flush=True)
+            return [], msg
 
     except Exception as e:
+        print(f"Error: {e}", flush=True)
+        import traceback; traceback.print_exc()
         return [], f"Error {e}"
 
 def trade_loop():
     ws=get_wallet()
-    print(f"START ${ws:.4f} | MIN +->{MIN_FUNDING*100}% | MAX ♾️ INFINITE | NEVER MISS 4H/8H | MISS ONLY 1) <0.5% 2) THIN BOOK | {LEVERAGE}X 99% SL {SL_PCT}%", flush=True)
-    last_log=0
+    print(f"START ${ws:.4f} | MIN +->{MIN_FUNDING*100}% MAX INF | 4H/8H LONG/SHORT HIGHEST | {LEVERAGE}X 99% SL {SL_PCT}%", flush=True)
     while True:
         now=datetime.now(timezone.utc)
         good_coins, rule_msg = get_all_funding_smart()
         wallet=get_wallet()
         
         if not good_coins:
-            if time.time()-last_log>60:
-                print(f"[{now.strftime('%H:%M:%S')} UTC] NO TRADE - {rule_msg} | Wallet ${wallet:.4f} | Checks MIN +->{MIN_FUNDING*100}% MAX ♾️", flush=True)
-                last_log=time.time()
             time.sleep(10)
             continue
         
@@ -178,13 +196,13 @@ def trade_loop():
         secs_to=(next_dt-now).total_seconds()
         
         if secs_to < 180:
-            print(f"[{now.strftime('%H:%M:%S')} UTC] {secs_to:.0f}s | NEVER MISS {good_coins[0]['symbol']} {good_coins[0]['rate']*100:+.4f}% {good_coins[0]['interval']}H {good_coins[0]['side']} Net ${good_coins[0].get('net_profit',0):.3f} | MIN +->{MIN_FUNDING*100}% MAX ♾️", flush=True)
+            print(f"[{now.strftime('%H:%M:%S')} UTC] {secs_to:.0f}s to funding | {good_coins[0]['symbol']} {good_coins[0]['rate']*100:+.3f}% {good_coins[0]['interval']}H", flush=True)
 
         if 0.02 < secs_to/60 <= (ENTRY_SEC/60) and LIVE:
             best=good_coins[0]; symbol=best['symbol']; rate=best['rate']; side=best['side']
             open_f=exchange.create_market_sell_order if side=="SHORT" else exchange.create_market_buy_order
             close_f=exchange.create_market_buy_order if side=="SHORT" else exchange.create_market_sell_order
-            print(f"\n=== ENTRY {secs_to:.0f}s | {symbol} {rate*100:+.4f}% {best['interval']}H {side} | MIN +->{MIN_FUNDING*100}% MAX ♾️ ===", flush=True)
+            print(f"\n=== ENTRY {secs_to:.0f}s | {symbol} {rate*100:+.4f}% {best['interval']}H {side} ===", flush=True)
             try:
                 entry=exchange.fetch_ticker(symbol)['last']
                 invest=wallet*INVEST_PCT
@@ -193,7 +211,7 @@ def trade_loop():
                 actual=min(want, max_fill*0.9) if max_fill>0 else want
                 amt=float(exchange.amount_to_precision(symbol, actual/entry))
                 sl=entry*(1+SL_PCT/100) if side=="SHORT" else entry*(1-SL_PCT/100)
-                print(f"Wallet ${wallet:.4f} | Pos ${actual:.2f} | {side} {amt} @ {entry} | SL {sl:.6f} | Funding {rate*100:+.4f}% MIN +->{MIN_FUNDING*100}% MAX ♾️", flush=True)
+                print(f"Wallet ${wallet:.4f} | Pos ${actual:.2f} | {side} {amt} @ {entry} | SL {sl:.6f}", flush=True)
                 open_f(symbol, amt)
                 print(f"OPENED {side}", flush=True)
                 exit_time=next_dt+timedelta(seconds=EXIT_SEC)
@@ -227,7 +245,7 @@ def trade_loop():
             time.sleep(90)
             continue
         
-        time.sleep(2 if secs_to<120 else 10)
+        time.sleep(3 if secs_to<120 else 10)
 
 if __name__=="__main__":
     trade_loop()
