@@ -1,0 +1,23 @@
+name: live-scan
+on:
+  schedule:
+    - cron: '59 3,7,11,15,19,23 * * *'
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install requests
+      - run: |
+          cat > scan.py << 'PY'
+          import requests
+          BASE="https://contract.mexc.com/api/v1/contract"
+          t=requests.get(f"{BASE}/ticker", timeout=15).json().get("data") or []
+          high=[(d["symbol"], float(d.get("fundingRate") or 0)*100) for d in t if str(d.get("symbol","")).endswith("_USDT") and abs(float(d.get("fundingRate") or 0))>=0.005]
+          high=sorted(high, key=lambda x: -abs(x[1]))
+          print(f"TOTAL {len(t)} perps | >=0.5%: {len(high)}")
+          for s,r in high: print(f"{s} {r:+.2f}%")
+          PY
+          python scan.py
