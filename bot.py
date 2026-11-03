@@ -5,7 +5,7 @@ import sys
 import requests
 from datetime import datetime, timezone, timedelta
 
-print("=== FINAL v18 - FAST SCAN - NO STUCK - MIN 0.5% MAX INF ===", flush=True)
+print("=== FINAL v18.1 - FAST SCAN FIXED SYNTAX - MIN 0.5% MAX INF ===", flush=True)
 
 API_KEY = os.getenv("MEXC_API_KEY")
 SECRET = os.getenv("MEXC_SECRET")
@@ -42,14 +42,11 @@ def check_orderbook_fast(symbol, wallet_usdt, side, rate):
     try:
         want_pos_usdt = wallet_usdt * INVEST_PCT * LEVERAGE
         if want_pos_usdt < 5: want_pos_usdt = 5
-        ob = exchange.fetch_order_book(symbol, limit=20)  # FAST 20 not 50
+        ob = exchange.fetch_order_book(symbol, limit=20)
         bids = ob.get('bids', []); asks = ob.get('asks', [])
         if not bids or not asks: return False, 99, 0, -999
-        
-        # USE BOOK MID - NO EXTRA TICKER CALL = 2X FASTER
         mid = (float(bids[0][0]) + float(asks[0][0])) / 2 if bids and asks else 0
         if not mid: return False, 99, 0, -999
-        
         book = bids if side=="SHORT" else asks
         filled_usdt=0; filled_amt=0; w_sum=0
         for entry in book:
@@ -74,7 +71,7 @@ def check_orderbook_fast(symbol, wallet_usdt, side, rate):
         net=funding - want_pos_usdt*(slip/100) - want_pos_usdt*0.0004
         can=slip<=MAX_SLIPPAGE_PCT and filled_usdt>=want_pos_usdt*0.9 and net>0
         return can, slip, max_fill, net
-    except Exception as e:
+    except:
         return False,99,0,-999
 
 def get_all_funding_smart():
@@ -119,7 +116,7 @@ def get_all_funding_smart():
             ops.append({'symbol':ccxt_sym,'rate':rate,'abs_rate':abs(rate),'interval':interval,'next_dt':next_dt,'secs_to':secs,'side':side})
         
         if not ops:
-            msg=f"Scanned {len(funding_list)} | 0 with MIN +->{MIN_FUNDING*100}% MAX INF -> MISS 1: LOW FUNDING"
+            msg=f"Scanned {len(funding_list)} | 0 with MIN +->{MIN_FUNDING*100}% MAX INF -> MISS LOW FUNDING"
             print(msg, flush=True)
             return [], msg
         
@@ -152,18 +149,20 @@ def get_all_funding_smart():
         
         wallet=get_wallet()
         print(f"{rule_msg} | Scanned {len(funding_list)} | {len(ops)} coins MIN 0.5% MAX INF | Wallet ${wallet:.2f} Pos ${wallet*INVEST_PCT*LEVERAGE:.2f}", flush=True)
-        print(f"Top 5 funding: {', '.join([f'{o[\"symbol\"]} {o[\"rate\"]*100:+.2f}%' for o in settling[:5]])}", flush=True)
+        
+        top5 = ", ".join([f"{x['symbol']} {x['rate']*100:+.2f}%" for x in settling[:5]])
+        print(f"Top 5 funding: {top5}", flush=True)
         
         good=[]
         print(f"Checking order book (fast, 10 coins max)...", flush=True)
-        for o in settling[:10]:  # ONLY 10 COINS = NO STUCK
+        for o in settling[:10]:
             can,slip,max_fill,net=check_orderbook_fast(o['symbol'], wallet, o['side'], o['rate'])
             o['slippage']=slip; o['max_fill']=max_fill; o['net_profit']=net; o['can_fill']=can
             if can:
-                print(f"  ✅ {o['symbol']} {o['rate']*100:+.3f}% {o['interval']}H {o['side']} Book ${max_fill:.0f} Slip {slip:.3f}% Net ${net:.3f}", flush=True)
+                print(f"  GOOD {o['symbol']} {o['rate']*100:+.3f}% {o['interval']}H {o['side']} Book ${max_fill:.0f} Slip {slip:.3f}% Net ${net:.3f}", flush=True)
                 good.append(o)
             else:
-                print(f"  ❌ SKIP {o['symbol']} {o['rate']*100:+.3f}% Book ${max_fill:.0f} Slip {slip:.2f}%", flush=True)
+                print(f"  SKIP {o['symbol']} {o['rate']*100:+.3f}% Book ${max_fill:.0f} Slip {slip:.2f}%", flush=True)
         
         if good:
             good.sort(key=lambda x: x['net_profit'], reverse=True)
@@ -171,7 +170,7 @@ def get_all_funding_smart():
             print(f"FINAL PICK: {best['symbol']} {best['rate']*100:+.3f}% {best['interval']}H {best['side']} Net ${best['net_profit']:.3f}", flush=True)
             return good, rule_msg
         else:
-            msg=f"No good book in top 10 | Wallet ${wallet:.2f} too big for books -> MISS 2: THIN BOOK"
+            msg=f"No good book in top 10 | Wallet ${wallet:.2f} -> MISS THIN BOOK"
             print(msg, flush=True)
             return [], msg
 
