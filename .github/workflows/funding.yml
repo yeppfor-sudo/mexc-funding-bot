@@ -1,11 +1,8 @@
 name: funding-bot
 on: [push, workflow_dispatch]
-
-# THIS STOPS THE PILE-UP
 concurrency:
   group: funding-bot-single
   cancel-in-progress: true
-
 jobs:
   bot:
     runs-on: ubuntu-latest
