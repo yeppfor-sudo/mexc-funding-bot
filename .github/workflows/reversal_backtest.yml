@@ -1,22 +1,3 @@
-name: reversal-test
-on:
-  workflow_dispatch:
-    inputs:
-      days:
-        description: 'Days'
-        default: '30'
-        type: string
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install requests
-
       - name: Run reversal backtest
         env:
           DAYS: ${{ inputs.days }}
@@ -25,7 +6,6 @@ jobs:
         run: |
           cat > reversal_test.py << 'PYEOF'
           import os, csv, statistics as st, time, requests
-
           DAYS = int(os.getenv("DAYS", "30"))
           HOLDS = [1, 3, 5, 10, 15]
           DELAYS = [0, 1]
@@ -40,115 +20,125 @@ jobs:
 
           def get(url, params=None):
               try:
-                  r = requests.get(url, params=params, timeout=20)
+                  r = requests.get(url, params=params, timeout=20, headers={"User-Agent":"Mozilla/5.0"})
                   return r.json()
-              except:
+              except Exception as e:
+                  print(f"GET fail {url} {e}")
                   return {}
 
           def tg(msg):
-              token = os.getenv("TELEGRAM_BOT_TOKEN")
-              chat = os.getenv("TELEGRAM_CHAT_ID")
-              if not token or not chat:
-                  print(msg)
-                  return
-              try:
-                  requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                                json={"chat_id": chat, "text": msg}, timeout=10)
-              except:
-                  pass
+              token=os.getenv("TELEGRAM_BOT_TOKEN"); chat=os.getenv("TELEGRAM_CHAT_ID")
+              if not token or not chat: print(msg); return
+              try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id":chat,"text":msg}, timeout=10)
+              except: pass
               print(msg)
 
-          def load_events(cs, since_ms):
-              events = {}
-              failed = 0
-              # Get all symbols
+          def load_events_real():
+              # Use direct known coins that have high funding - BMT, CAT, etc + scan
+              # New MEXC endpoint for funding history
+              events = []
+              # Try to get funding rate history for all - use batch endpoint
+              # MEXC actually uses: /funding_rate/history?symbol=xxx
               j = get(f"{BASE}/ticker")
-              syms = [d["symbol"] for d in (j.get("data") or []) if str(d.get("symbol","")).endswith("_USDT")]
-              print(f"Checking {len(syms)} symbols...")
-              for sym in syms[:100]:  # limit 100 to avoid timeout
-                  try:
-                      jr = get(f"{BASE}/funding_rate/{sym}")
-                      data = jr.get("data") or {}
-                      # Try funding history
-                      jh = get(f"{BASE}/funding_rate_history", {"symbol": sym, "page_size": 200})
-                      lst = (jh.get("data") or {}).get("resultList") or (jh.get("data") or {}).get("result") or []
-                      for it in lst:
-                          T = int(it.get("settleTime") or it.get("fundingTime") or 0)
-                          if T < since_ms: continue
-                          rate = float(it.get("fundingRate") or 0)
-                          if abs(rate) < 0.0005: continue
-                          # Convert to seconds
-                          Ts = T//1000 if T>1e12 else T
-                          # Round to 4h slot
-                          Tslot = Ts - (Ts % 14400)
-                          events.setdefault(sym, []).append({"T": Tslot, "rate": rate, "sym": sym})
-                  except:
-                      failed+=1
-              # flatten
+              data = j.get("data") or []
+              syms = [d.get("symbol") for d in data if str(d.get("symbol","")).endswith("_USDT")][:150]
+              print(f"Got {len(syms)} symbols from ticker, sample {syms[:5]}")
+              if not syms:
+                  # Fallback list - known high funding coins
+                  syms = ["BMT_USDT","CAT_USDT","BERA_USDT","AVAAI_USDT","AIXBT_USDT","SWARMS_USDT"]
+              
               slots = {}
-              flat_events = {}
-              for sym, evs in events.items():
-                  for e in evs:
-                      slots.setdefault(e["T"], []).append(e)
-                  flat_events[sym]=evs
-              return flat_events, failed, slots
+              failed=0
+              since = int((time.time() - DAYS*86400)*1000)
+              
+              for sym in syms:
+                  try:
+                      # Correct endpoint: /funding_rate_history?symbol=...
+                      jh = get(f"{BASE}/funding_rate_history", {"symbol": sym, "page_size": 200})
+                      lst = []
+                      if isinstance(jh.get("data"), dict):
+                          lst = jh["data"].get("resultList") or jh["data"].get("result") or []
+                      elif isinstance(jh.get("data"), list):
+                          lst = jh["data"]
+                      if not lst:
+                          # Try alt endpoint
+                          jh2 = get(f"{BASE}/funding_rate/{sym}")
+                          d2 = jh2.get("data") or {}
+                          # single current rate not history - skip
+                          continue
+                      for it in lst:
+                          T = int(it.get("settleTime") or it.get("time") or it.get("fundingTime") or 0)
+                          if T==0: continue
+                          if T < since: continue
+                          rate = float(it.get("fundingRate") or it.get("rate") or 0)
+                          if abs(rate) < 0.0005: continue
+                          Ts = T//1000 if T>1e12 else T
+                          Tslot = Ts - (Ts % 14400)
+                          ev = {"T": Tslot, "rate": rate, "sym": sym}
+                          slots.setdefault(Tslot, []).append(ev)
+                          events.append(ev)
+                  except Exception as e:
+                      failed+=1
+              print(f"Collected {len(events)} raw funding events across {len(slots)} slots, failed {failed}")
+              return slots, failed
 
           def kl(sym, T):
               j = get(f"{BASE}/kline/{sym}", {"interval": "Min1", "start": int(T - 300), "end": int(T + 1260)})
               d = ((j or {}).get("data")) or {}
               out = {}
-              for t, o, h, l, c, v in zip(d.get("time", []), d.get("open", []), d.get("high", []),
-                                          d.get("low", []), d.get("close", []), d.get("vol", [])):
-                  out[int(t)] = (float(o), float(h), float(l), float(c), float(v))
+              times = d.get("time") or d.get("t") or []
+              opens = d.get("open") or d.get("o") or []
+              highs = d.get("high") or d.get("h") or []
+              lows = d.get("low") or d.get("l") or []
+              closes = d.get("close") or d.get("c") or []
+              vols = d.get("vol") or d.get("v") or []
+              for t,o,h,l,c,v in zip(times, opens, highs, lows, closes, vols):
+                  try: out[int(t)] = (float(o), float(h), float(l), float(c), float(v))
+                  except: pass
               return out
 
-          def pick_events(slots, cs):
-              chosen = []
+          def pick_events(slots):
+              chosen=[]
               for T in sorted(slots):
                   for ev in sorted(slots[T], key=lambda e: -abs(e["rate"]))[:TOP_TRY]:
-                      k = kl(ev["sym"], T)
-                      if not k.get(T - 60) or not k.get(T): continue
-                      try:
-                          turn = sum(v * cs.get(ev["sym"],1) * c for tt, (o,h,l,c,v) in k.items() if tt < T)
-                      except:
-                          turn = 0
-                      if turn < VOL_MULT * LIQ_NOTIONAL: continue
-                      chosen.append((ev, k))
+                      k=kl(ev["sym"], T)
+                      if not k.get(T-60) or not k.get(T): continue
+                      # liquidity check: sum vol*price in 5 min before
+                      turn = sum(v*c for (o,h,l,c,v) in (k[tt] for tt in k if tt < T))
+                      if turn < VOL_MULT*LIQ_NOTIONAL and turn!=0: continue
+                      if len(k)<5: continue
+                      chosen.append((ev,k))
                       break
               return chosen
 
-          def sim(k, T, rate, delay, hold, stop, slip):
-              s = 1 if rate > 0 else -1
-              te = T + 60 * delay
-              c = k.get(te)
+          def sim(k,T,rate,delay,hold,stop,slip):
+              s=1 if rate>0 else -1
+              te=T+60*delay
+              c=k.get(te)
               if not c: return None
-              entry = c[0] * (1 + s * slip)
-              last = None
+              entry=c[0]*(1+s*slip)
+              last=None
               for i in range(hold):
-                  cd = k.get(te + 60 * i)
+                  cd=k.get(te+60*i)
                   if not cd: return None
-                  adverse = cd[2] if s == 1 else cd[1]
-                  if s * (adverse - entry) / entry <= -stop:
-                      return -(stop + SL_EXTRA) - 2 * FEE_SIDE
-                  last = cd
-              return s * (last[3] * (1 - s * slip) - entry) / entry - 2 * FEE_SIDE
+                  adverse=cd[2] if s==1 else cd[1]
+                  if s*(adverse-entry)/entry <= -stop:
+                      return -(stop+SL_EXTRA)-2*FEE_SIDE
+                  last=cd
+              return s*(last[3]*(1-s*slip)-entry)/entry - 2*FEE_SIDE
 
           def summarize(rets):
-              n = len(rets)
-              mean = sum(rets)/n
-              sd = st.pstdev(rets) if n>1 else 0
-              return dict(n=n, mean=mean, med=st.median(rets), win=sum(1 for r in rets if r>0)/n,
-                          t=(mean/(sd/n**0.5)) if sd>0 else 0, worst=min(rets))
+              n=len(rets); mean=sum(rets)/n; sd=st.pstdev(rets) if n>1 else 0
+              return dict(n=n, mean=mean, med=st.median(rets), win=sum(1 for r in rets if r>0)/n, t=(mean/(sd/n**0.5)) if sd>0 else 0, worst=min(rets))
 
           def main():
-              since = time.time() - DAYS*86400
-              j = get(f"{BASE}/detail") or {}
-              cs = {d["symbol"]: float(d.get("contractSize") or 1) for d in (j.get("data") or []) if str(d.get("symbol","")).endswith("_USDT")}
-              events, failed, slots = load_events(cs, since*1000)
-              chosen = pick_events(slots, cs)
-              print(f"{len(chosen)} funding events usable (of {len(slots)} slots), {failed} failed")
-              if len(chosen) < 10:
-                  tg("Reversal test: too few events")
+              slots, failed = load_events_real()
+              chosen = pick_events(slots)
+              print(f"{len(chosen)} usable (of {len(slots)} slots)")
+              if len(chosen)<10:
+                  tg(f"Reversal test: too few events ({len(chosen)}). API may be blocking. Slots={len(slots)}")
+                  # Still create empty csv to avoid upload warning
+                  open("reversal_results.csv","w").write("delay,hold,stop,slip,n,avg\n")
                   return
               rows=[]
               for delay in DELAYS:
@@ -163,8 +153,7 @@ jobs:
                               row[f"s{slip}"]=rets
                           rows.append(row)
               with open("reversal_results.csv","w",newline="") as f:
-                  w=csv.writer(f)
-                  w.writerow(["delay_min","hold_min","stop","slip","n","avg_net_pct","median_pct","win_pct","t_stat","worst_pct"])
+                  w=csv.writer(f); w.writerow(["delay_min","hold_min","stop","slip","n","avg_net_pct","median_pct","win_pct","t_stat","worst_pct"])
                   for row in rows:
                       for slip in SLIPS:
                           rets=[r for _,_,r in row[f"s{slip}"]]
@@ -176,20 +165,16 @@ jobs:
               lines=[]
               for r in ranked[:5]:
                   m=summarize([x for _,_,x in r[mid]]); m3=summarize([x for _,_,x in r[hi]])
-                  ts=sorted(r[mid]); cut=len(ts)*2//3
-                  a=[x for _,_,x in ts[:cut]]; c=[x for _,_,x in ts[cut:]]
+                  ts=sorted(r[mid]); cut=len(ts)*2//3; a=[x for _,_,x in ts[:cut]]; c=[x for _,_,x in ts[cut:]]
                   first=sum(a)/len(a)*100 if a else 0; last=sum(c)/len(c)*100 if c else 0
                   lines.append(f"enter +{r['delay']}m hold {r['hold']}m stop {r['stop']*100:.0f}%: n={m['n']} avg {m['mean']*100:+.2f}% win {m['win']*100:.0f}% t={m['t']:.1f} | 0.30% slip: {m3['mean']*100:+.2f}% | first 2/3 {first:+.2f}% vs last {last:+.2f}%")
-              best=ranked[0]
-              bm,bm3=summarize([x for _,_,x in best[mid]]), summarize([x for _,_,x in best[hi]])
-              ts=sorted(best[mid]); cut=len(ts)*2//3
-              stable=sum(x for _,_,x in ts[:cut])>0 and sum(x for _,_,x in ts[cut:])>0
+              best=ranked[0]; bm,bm3=summarize([x for _,_,x in best[mid]]), summarize([x for _,_,x in best[hi]])
+              ts=sorted(best[mid]); cut=len(ts)*2//3; stable=sum(x for _,_,x in ts[:cut])>0 and sum(x for _,_,x in ts[cut:])>0
               verdict=("POSSIBLE EDGE" if (bm3["mean"]>0 and bm["t"]>=2 and stable) else "NO RELIABLE EDGE - do not trade")
               pos=[x for _,rt,x in best[mid] if rt>0]; neg=[x for _,rt,x in best[mid] if rt<0]
               tg(f"🔁 REVERSAL TEST {DAYS}d | {len(chosen)} events\nCosts: fee {FEE_SIDE*100:.2f}%/side + slip; ranked at 0.15%\n\n"+"\n".join(lines)+f"\n\nBest: +fund {sum(pos)/len(pos)*100 if pos else 0:+.2f}% n={len(pos)}, -fund {sum(neg)/len(neg)*100 if neg else 0:+.2f}% n={len(neg)}\nVERDICT: {verdict}")
 
-          if __name__=="__main__":
-              main()
+          if __name__=="__main__": main()
           PYEOF
           python reversal_test.py
 
