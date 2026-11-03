@@ -1,9 +1,8 @@
-name: final-50s-avg-SL3pct
+name: real-funding-test
 on:
   workflow_dispatch:
     inputs:
       days: {default: '30'}
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -12,129 +11,47 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: pip install requests
-      - name: Run
+      - name: Run REAL funding
         env:
           DAYS: ${{ inputs.days }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          cat > reversal_test.py << 'PYEOF'
-          import os, statistics as st, time, requests
-          DAYS=int(os.getenv("DAYS","30"))
+          cat > real_test.py << 'PYEOF'
+          import requests, time, statistics as st
           BASE="https://contract.mexc.com/api/v1/contract"
-          FEE=0.0002
           SYMS=["BMT_USDT","CAT_USDT"]
-          SLIPS=[0.0005,0.0015,0.003]
-          LEV=5
-          PRICE_SL=0.03  # your -3% price stop
-          WALLET_SL=PRICE_SL*LEV  # -15% wallet
-          SL_EXTRA=0.003  # extra slippage on stop
-          HOLDS=[2,3]
-
+          DAYS=30
           def get(u,p=None):
             try: return requests.get(u, params=p, timeout=20, headers={"User-Agent":"Mozilla/5.0"}).json()
             except: return {}
-          def tg(m):
-            print(m)
-            tok=os.getenv("TELEGRAM_BOT_TOKEN"); chat=os.getenv("TELEGRAM_CHAT_ID")
-            if tok and chat:
-              try: requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", json={"chat_id":chat,"text":m[:4000]}, timeout=10)
-              except: pass
-          def kl(sym,T):
-            j=get(f"{BASE}/kline/{sym}", {"interval":"Min1","start":int(T-120),"end":int(T+600)})
-            d=(j or {}).get("data") or {}; out={}
-            for t,o,h,l,c,v in zip(d.get("time",[]), d.get("open",[]), d.get("high",[]), d.get("low",[]), d.get("close",[]), d.get("vol",[])):
-              try: out[int(t)]=(float(o),float(h),float(l),float(c),float(v))
-              except: pass
-            return out
-
-          def sim_avg_sl(k,T,rate,hold_avg,slip):
-            # ENTRY T-50s
-            entry_candle=k.get(T-60)
-            if not entry_candle: return None
-            entry=entry_candle[0]*(1+slip)
-            
-            # Check SL hit from T-50s to T+hold
-            for i in range(-1, hold_avg):
-              cd=k.get(T+60*i)
-              if not cd: continue
-              # low price hit -3%
-              if (cd[2]-entry)/entry <= -PRICE_SL:
-                # SL hit - price -3% + slippage
-                price_ret = -(PRICE_SL+SL_EXTRA) - 2*FEE
-                # did we get funding before SL?
-                if T-60 + 60*i >= T: price_ret += rate
-                wallet_ret = price_ret * LEV
-                return wallet_ret, True  # True = stopped
-            
-            # No SL, AVG exit
-            closes=[]
-            for i in range(hold_avg):
-              cd=k.get(T+60*i)
-              if not cd: return None
-              closes.append(cd[3])
-            avg_exit=sum(closes)/len(closes) * (1 - slip*0.5)
-            price_ret = (avg_exit-entry)/entry - 2*FEE + rate
-            wallet_ret = price_ret * LEV
-            return wallet_ret, False
-
-          def summarize(rets):
-            n=len(rets); mean=sum(rets)/n if n else 0; sd=st.pstdev(rets) if n>1 else 0
-            return dict(n=n, mean=mean, med=st.median(rets) if n else 0, win=sum(1 for r in rets if r>0)/n if n else 0, t=(mean/(sd/n**0.5)) if sd>0 else 0, worst=min(rets) if n else 0, stops=sum(1 for r,s in rets if s))
-
-          def main():
-            now=int(time.time()); since=now-DAYS*86400; slots=[]; t=since - (since%14400)
-            while t<=now: slots.append(t); t+=14400
-            chosen=[]
-            for T in slots:
-              for sym in SYMS:
-                k=kl(sym,T)
-                if len(k)<5 or not k.get(T-60): continue
-                chosen.append(({"T":T,"rate":0.007,"sym":sym},k))
-            print(f"Usable {len(chosen)}")
-            if len(chosen)<10:
-              open("reversal_results.csv","w").write("n\n"); tg("Too few"); return
-            
-            lines=[]
-            for hold in HOLDS:
-              for slip in SLIPS:
-                results=[]
-                for ev,k in chosen:
-                  r=sim_avg_sl(k,ev["T"],ev["rate"],hold,slip)
-                  if r: results.append(r)  # (wallet_ret, stopped)
-                
-                if not results: continue
-                wallet_rets=[w for w,s in results]
-                m=dict(
-                  n=len(wallet_rets),
-                  mean=sum(wallet_rets)/len(wallet_rets),
-                  med=st.median(wallet_rets),
-                  win=sum(1 for x in wallet_rets if x>0)/len(wallet_rets),
-                  t=(sum(wallet_rets)/len(wallet_rets))/(st.pstdev(wallet_rets)/len(wallet_rets)**0.5) if len(wallet_rets)>1 and st.pstdev(wallet_rets)>0 else 0,
-                  worst=min(wallet_rets),
-                  stops=sum(1 for w,s in results if s)
-                )
-                lines.append((hold,slip,m))
-
-            lines=sorted(lines, key=lambda x: -x[2]["mean"])
-            out=[]
-            for hold,slip,m in lines:
-              out.append(f"AVG {hold}m SL -3% price/-15% wallet | slip {slip*100:.2f}%: WALLET avg {m['mean']*100:+.2f}% med {m['med']*100:+.2f}% win {m['win']*100:.0f}% worst {m['worst']*100:+.1f}% stops {m['stops']}/{m['n']} t={m['t']:.1f}")
-
-            # verdict
-            best=[x for x in lines if x[1]==0.0015]
-            if best:
-              bm=best[0][2]
-              worst_03=[x for x in lines if x[1]==0.003]
-              bm30=worst_03[0][2] if worst_03 else bm
-              verdict="POSSIBLE EDGE" if bm30["mean"]>0 and bm["t"]>1.5 and bm["stops"]/bm["n"]<0.15 else "NO EDGE or too many SL"
-            else:
-              verdict="NO DATA"
-
-            tg(f"FINAL: T-50s ENTER, AVG EXIT, SL -3%/-15% wallet @5x | {DAYS}d BMT/CAT {len(chosen)} events\nFunding 0.7% price = 3.5% wallet\n\n"+"\n".join(out[:6])+f"\n\nVERDICT: {verdict}\nMax loss per trade -16.5% wallet ( -3% + 0.3% slip ) x5")
-
-          if __name__=="__main__": main()
+          def fetch_funding_history(sym):
+            # Try 2 endpoints that work
+            j1=get(f"{BASE}/funding_rate_history", {"symbol": sym, "page_size": 200})
+            lst=[]
+            if isinstance(j1.get("data"), dict):
+              lst=j1["data"].get("resultList",[])
+            if lst:
+              return lst
+            # fallback single
+            j2=get(f"{BASE}/funding_rate/{sym}")
+            if j2.get("data"):
+              return [j2["data"]]
+            return []
+          # Fetch real funding for 30 days
+          all_events=[]
+          for sym in SYMS:
+            hist=fetch_funding_history(sym)
+            print(f"{sym} got {len(hist)} funding records sample {hist[:1]}")
+            for it in hist:
+              T=int(it.get("settleTime") or it.get("time") or 0)
+              if T==0: continue
+              if T< (time.time()-DAYS*86400)*1000: continue
+              rate=float(it.get("fundingRate") or it.get("rate") or 0)
+              all_events.append((T//1000, rate, sym))
+          print(f"Total real funding events: {len(all_events)}")
+          # Now backtest with real rates...
           PYEOF
-          python reversal_test.py
+          python real_test.py
       - uses: actions/upload-artifact@v4
-        with: {name: reversal-results, path: reversal_results.csv}
+        with: {name: real-funding, path: real_test.py}
