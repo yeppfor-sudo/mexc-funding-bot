@@ -32,7 +32,7 @@ jobs:
           SL_EXTRA=0.003
           BASE="https://contract.mexc.com/api/v1/contract"
           FEE=0.0002
-          SYMS=["BMT_USDT","CAT_USDT"]  # test only your coins
+          SYMS=["BMT_USDT","CAT_USDT"]
 
           def get(url, params=None):
             try:
@@ -74,70 +74,62 @@ jobs:
             return s*(last[3]*(1-s*slip)-entry)/entry - 2*FEE
 
           def summarize(rets):
-            n=len(rets); mean=sum(rets)/n; sd=st.pstdev(rets) if n>1 else 0
-            return dict(n=n, mean=mean, med=st.median(rets), win=sum(1 for r in rets if r>0)/n, t=(mean/(sd/n**0.5)) if sd>0 else 0, worst=min(rets))
+            n=len(rets); mean=sum(rets)/n if n else 0; sd=st.pstdev(rets) if n>1 else 0
+            return dict(n=n, mean=mean, med=st.median(rets) if n else 0, win=sum(1 for r in rets if r>0)/n if n else 0, t=(mean/(sd/n**0.5)) if sd>0 else 0, worst=min(rets) if n else 0)
 
-          # Generate funding slots for last DAYS - every 4 hours
-          now=int(time.time())
-          since=now-DAYS*86400
-          slots=[]
-          t=since - (since%14400)
-          while t<=now:
-            slots.append(t)
-            t+=14400
-
-          print(f"Testing {len(slots)} slots x {len(SYMS)} coins = {len(slots)*len(SYMS)} events")
-          chosen=[]
-          for T in slots:
-            for sym in SYMS:
-              k=kl(sym,T)
-              if len(k)<3: continue
-              # Assume positive funding for test (long after dump) - rate>0
-              # For reversal we need direction: if funding positive, price dumped, so we LONG
-              # We'll test with rate=0.007 (positive)
-              ev={"T":T,"rate":0.007,"sym":sym}
-              if not k.get(T-60) or not k.get(T): continue
-              chosen.append((ev,k))
-
-          print(f"Usable {len(chosen)}")
-          if len(chosen)<10:
-            tg(f"Reversal test: too few klines ({len(chosen)}). MEXC kline API blocked?"); open("reversal_results.csv","w").write("n\n"); return
-
-          rows=[]
-          for delay in DELAYS:
-            for hold in HOLDS:
-              for stop in STOPS:
-                row=dict(delay=delay,hold=hold,stop=stop)
+          def main():
+            now=int(time.time()); since=now-DAYS*86400
+            slots=[]; t=since - (since%14400)
+            while t<=now:
+              slots.append(t); t+=14400
+            print(f"Testing {len(slots)} slots x {len(SYMS)} coins")
+            chosen=[]
+            for T in slots:
+              for sym in SYMS:
+                k=kl(sym,T)
+                if len(k)<3: continue
+                ev={"T":T,"rate":0.007,"sym":sym}
+                if not k.get(T-60) or not k.get(T): continue
+                chosen.append((ev,k))
+            print(f"Usable {len(chosen)}")
+            if len(chosen)<10:
+              with open("reversal_results.csv","w") as ff: ff.write("n\n")
+              tg(f"Reversal: too few klines {len(chosen)} - kline API blocked?")
+              return
+            rows=[]
+            for delay in DELAYS:
+              for hold in HOLDS:
+                for stop in STOPS:
+                  row=dict(delay=delay,hold=hold,stop=stop)
+                  for slip in SLIPS:
+                    rets=[]
+                    for ev,k in chosen:
+                      r=sim(k,ev["T"],ev["rate"],delay,hold,stop,slip)
+                      if r is not None: rets.append((ev["T"],ev["rate"],r))
+                    row[f"s{slip}"]=rets
+                  rows.append(row)
+            with open("reversal_results.csv","w",newline="") as f:
+              w=csv.writer(f); w.writerow(["delay","hold","stop","slip","n","avg%","med%","win%","t","worst%"])
+              for row in rows:
                 for slip in SLIPS:
-                  rets=[]
-                  for ev,k in chosen:
-                    r=sim(k,ev["T"],ev["rate"],delay,hold,stop,slip)
-                    if r is not None: rets.append((ev["T"],ev["rate"],r))
-                  row[f"s{slip}"]=rets
-                rows.append(row)
+                  rets=[r for _,_,r in row[f"s{slip}"]]
+                  if rets:
+                    m=summarize(rets)
+                    w.writerow([row["delay"],row["hold"],row["stop"],slip,m["n"],round(m["mean"]*100,3),round(m["med"]*100,3),round(m["win"]*100,1),round(m["t"],2),round(m["worst"]*100,2)])
+            mid=f"s{SLIPS[1]}"; hi=f"s{SLIPS[2]}"
+            ranked=sorted([r for r in rows if r[mid]], key=lambda r: -summarize([x for _,_,x in r[mid]])["mean"])
+            lines=[]
+            for r in ranked[:5]:
+              m=summarize([x for _,_,x in r[mid]]); m3=summarize([x for _,_,x in r[hi]])
+              ts=sorted(r[mid]); cut=len(ts)*2//3; a=[x for _,_,x in ts[:cut]]; c=[x for _,_,x in ts[cut:]]
+              first=sum(a)/len(a)*100 if a else 0; last=sum(c)/len(c)*100 if c else 0
+              lines.append(f"enter +{r['delay']}m hold {r['hold']}m stop {r['stop']*100:.0f}%: n={m['n']} avg {m['mean']*100:+.3f}% win {m['win']*100:.0f}% t={m['t']:.1f} | 0.30% slip {m3['mean']*100:+.3f}% | first 2/3 {first:+.2f}% vs last {last:+.2f}%")
+            best=ranked[0]; bm,bm3=summarize([x for _,_,x in best[mid]]), summarize([x for _,_,x in best[hi]])
+            ts=sorted(best[mid]); cut=len(ts)*2//3; stable=sum(x for _,_,x in ts[:cut])>0 and sum(x for _,_,x in ts[cut:])>0
+            verdict=("POSSIBLE EDGE" if (bm3["mean"]>0 and bm["t"]>=2 and stable) else "NO EDGE")
+            tg(f"REVERSAL {DAYS}d BMT/CAT | {len(chosen)} events LONG after dump\nFee {FEE*100:.2f}%/side slip ranked 0.15%\n\n"+"\n".join(lines)+f"\n\nVERDICT: {verdict}")
 
-          with open("reversal_results.csv","w",newline="") as f:
-            w=csv.writer(f); w.writerow(["delay","hold","stop","slip","n","avg%","med%","win%","t","worst%"])
-            for row in rows:
-              for slip in SLIPS:
-                rets=[r for _,_,r in row[f"s{slip}"]]
-                if rets:
-                  m=summarize(rets)
-                  w.writerow([row["delay"],row["hold"],row["stop"],slip,m["n"],round(m["mean"]*100,3),round(m["med"]*100,3),round(m["win"]*100,1),round(m["t"],2),round(m["worst"]*100,2)])
-
-          mid=f"s{SLIPS[1]}"; hi=f"s{SLIPS[2]}"
-          ranked=sorted([r for r in rows if r[mid]], key=lambda r: -summarize([x for _,_,x in r[mid]])["mean"])
-          lines=[]
-          for r in ranked[:5]:
-            m=summarize([x for _,_,x in r[mid]]); m3=summarize([x for _,_,x in r[hi]])
-            ts=sorted(r[mid]); cut=len(ts)*2//3; a=[x for _,_,x in ts[:cut]]; c=[x for _,_,x in ts[cut:]]
-            first=sum(a)/len(a)*100 if a else 0; last=sum(c)/len(c)*100 if c else 0
-            lines.append(f"enter +{r['delay']}m hold {r['hold']}m stop {r['stop']*100:.0f}%: n={m['n']} avg {m['mean']*100:+.3f}% (~{m['mean']*5*0.99*100:+.1f}% wallet @5x) win {m['win']*100:.0f}% t={m['t']:.1f} | 0.30% slip {m3['mean']*100:+.3f}% | first 2/3 {first:+.2f}% vs last {last:+.2f}%")
-          best=ranked[0]; bm,bm3=summarize([x for _,_,x in best[mid]]), summarize([x for _,_,x in best[hi]])
-          ts=sorted(best[mid]); cut=len(ts)*2//3; stable=sum(x for _,_,x in ts[:cut])>0 and sum(x for _,_,x in ts[cut:])>0
-          verdict=("POSSIBLE EDGE" if (bm3["mean"]>0 and bm["t"]>=2 and stable) else "NO EDGE")
-          tg(f"🔁 REVERSAL TEST {DAYS}d BMT/CAT only | {len(chosen)} events | LONG after funding (price dumped)\nCosts fee {FEE*100:.2f}%/side + slip ranked 0.15%\n\n"+"\n".join(lines)+f"\n\nVERDICT: {verdict}\nNote: best of {len(rows)} configs overstates; trust if 0.30% slip & split stay positive")
-
+          if __name__=="__main__": main()
           PYEOF
           python reversal_test.py
 
