@@ -1,10 +1,8 @@
-name: reversal-test
+name: final-50s-avg-SL3pct
 on:
   workflow_dispatch:
     inputs:
-      days:
-        description: Days
-        default: '30'
+      days: {default: '30'}
 
 jobs:
   test:
@@ -12,128 +10,131 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        with: {python-version: '3.11'}
       - run: pip install requests
-
-      - name: Run reversal backtest
+      - name: Run
         env:
           DAYS: ${{ inputs.days }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           cat > reversal_test.py << 'PYEOF'
-          import os, csv, statistics as st, time, requests
+          import os, statistics as st, time, requests
           DAYS=int(os.getenv("DAYS","30"))
-          HOLDS=[1,3,5,10,15]
-          DELAYS=[0,1]
-          STOPS=[0.01,0.02]
-          SLIPS=[0.0005,0.0015,0.003]
-          SL_EXTRA=0.003
           BASE="https://contract.mexc.com/api/v1/contract"
           FEE=0.0002
           SYMS=["BMT_USDT","CAT_USDT"]
+          SLIPS=[0.0005,0.0015,0.003]
+          LEV=5
+          PRICE_SL=0.03  # your -3% price stop
+          WALLET_SL=PRICE_SL*LEV  # -15% wallet
+          SL_EXTRA=0.003  # extra slippage on stop
+          HOLDS=[2,3]
 
-          def get(url, params=None):
-            try:
-              r=requests.get(url, params=params, timeout=20, headers={"User-Agent":"Mozilla/5.0"})
-              return r.json()
-            except Exception as e:
-              print(f"FAIL {url} {e}"); return {}
-
+          def get(u,p=None):
+            try: return requests.get(u, params=p, timeout=20, headers={"User-Agent":"Mozilla/5.0"}).json()
+            except: return {}
           def tg(m):
             print(m)
             tok=os.getenv("TELEGRAM_BOT_TOKEN"); chat=os.getenv("TELEGRAM_CHAT_ID")
             if tok and chat:
               try: requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", json={"chat_id":chat,"text":m[:4000]}, timeout=10)
               except: pass
-
           def kl(sym,T):
-            j=get(f"{BASE}/kline/{sym}", {"interval":"Min1","start":int(T-300),"end":int(T+1260)})
-            d=(j or {}).get("data") or {}
-            out={}
+            j=get(f"{BASE}/kline/{sym}", {"interval":"Min1","start":int(T-120),"end":int(T+600)})
+            d=(j or {}).get("data") or {}; out={}
             for t,o,h,l,c,v in zip(d.get("time",[]), d.get("open",[]), d.get("high",[]), d.get("low",[]), d.get("close",[]), d.get("vol",[])):
               try: out[int(t)]=(float(o),float(h),float(l),float(c),float(v))
               except: pass
             return out
 
-          def sim(k,T,rate,delay,hold,stop,slip):
-            s=1 if rate>0 else -1
-            te=T+60*delay
-            c=k.get(te)
-            if not c: return None
-            entry=c[0]*(1+s*slip)
-            last=None
-            for i in range(hold):
-              cd=k.get(te+60*i)
+          def sim_avg_sl(k,T,rate,hold_avg,slip):
+            # ENTRY T-50s
+            entry_candle=k.get(T-60)
+            if not entry_candle: return None
+            entry=entry_candle[0]*(1+slip)
+            
+            # Check SL hit from T-50s to T+hold
+            for i in range(-1, hold_avg):
+              cd=k.get(T+60*i)
+              if not cd: continue
+              # low price hit -3%
+              if (cd[2]-entry)/entry <= -PRICE_SL:
+                # SL hit - price -3% + slippage
+                price_ret = -(PRICE_SL+SL_EXTRA) - 2*FEE
+                # did we get funding before SL?
+                if T-60 + 60*i >= T: price_ret += rate
+                wallet_ret = price_ret * LEV
+                return wallet_ret, True  # True = stopped
+            
+            # No SL, AVG exit
+            closes=[]
+            for i in range(hold_avg):
+              cd=k.get(T+60*i)
               if not cd: return None
-              adverse=cd[2] if s==1 else cd[1]
-              if s*(adverse-entry)/entry <= -stop:
-                return -(stop+SL_EXTRA)-2*FEE
-              last=cd
-            return s*(last[3]*(1-s*slip)-entry)/entry - 2*FEE
+              closes.append(cd[3])
+            avg_exit=sum(closes)/len(closes) * (1 - slip*0.5)
+            price_ret = (avg_exit-entry)/entry - 2*FEE + rate
+            wallet_ret = price_ret * LEV
+            return wallet_ret, False
 
           def summarize(rets):
             n=len(rets); mean=sum(rets)/n if n else 0; sd=st.pstdev(rets) if n>1 else 0
-            return dict(n=n, mean=mean, med=st.median(rets) if n else 0, win=sum(1 for r in rets if r>0)/n if n else 0, t=(mean/(sd/n**0.5)) if sd>0 else 0, worst=min(rets) if n else 0)
+            return dict(n=n, mean=mean, med=st.median(rets) if n else 0, win=sum(1 for r in rets if r>0)/n if n else 0, t=(mean/(sd/n**0.5)) if sd>0 else 0, worst=min(rets) if n else 0, stops=sum(1 for r,s in rets if s))
 
           def main():
-            now=int(time.time()); since=now-DAYS*86400
-            slots=[]; t=since - (since%14400)
-            while t<=now:
-              slots.append(t); t+=14400
-            print(f"Testing {len(slots)} slots x {len(SYMS)} coins")
+            now=int(time.time()); since=now-DAYS*86400; slots=[]; t=since - (since%14400)
+            while t<=now: slots.append(t); t+=14400
             chosen=[]
             for T in slots:
               for sym in SYMS:
                 k=kl(sym,T)
-                if len(k)<3: continue
-                ev={"T":T,"rate":0.007,"sym":sym}
-                if not k.get(T-60) or not k.get(T): continue
-                chosen.append((ev,k))
+                if len(k)<5 or not k.get(T-60): continue
+                chosen.append(({"T":T,"rate":0.007,"sym":sym},k))
             print(f"Usable {len(chosen)}")
             if len(chosen)<10:
-              with open("reversal_results.csv","w") as ff: ff.write("n\n")
-              tg(f"Reversal: too few klines {len(chosen)} - kline API blocked?")
-              return
-            rows=[]
-            for delay in DELAYS:
-              for hold in HOLDS:
-                for stop in STOPS:
-                  row=dict(delay=delay,hold=hold,stop=stop)
-                  for slip in SLIPS:
-                    rets=[]
-                    for ev,k in chosen:
-                      r=sim(k,ev["T"],ev["rate"],delay,hold,stop,slip)
-                      if r is not None: rets.append((ev["T"],ev["rate"],r))
-                    row[f"s{slip}"]=rets
-                  rows.append(row)
-            with open("reversal_results.csv","w",newline="") as f:
-              w=csv.writer(f); w.writerow(["delay","hold","stop","slip","n","avg%","med%","win%","t","worst%"])
-              for row in rows:
-                for slip in SLIPS:
-                  rets=[r for _,_,r in row[f"s{slip}"]]
-                  if rets:
-                    m=summarize(rets)
-                    w.writerow([row["delay"],row["hold"],row["stop"],slip,m["n"],round(m["mean"]*100,3),round(m["med"]*100,3),round(m["win"]*100,1),round(m["t"],2),round(m["worst"]*100,2)])
-            mid=f"s{SLIPS[1]}"; hi=f"s{SLIPS[2]}"
-            ranked=sorted([r for r in rows if r[mid]], key=lambda r: -summarize([x for _,_,x in r[mid]])["mean"])
+              open("reversal_results.csv","w").write("n\n"); tg("Too few"); return
+            
             lines=[]
-            for r in ranked[:5]:
-              m=summarize([x for _,_,x in r[mid]]); m3=summarize([x for _,_,x in r[hi]])
-              ts=sorted(r[mid]); cut=len(ts)*2//3; a=[x for _,_,x in ts[:cut]]; c=[x for _,_,x in ts[cut:]]
-              first=sum(a)/len(a)*100 if a else 0; last=sum(c)/len(c)*100 if c else 0
-              lines.append(f"enter +{r['delay']}m hold {r['hold']}m stop {r['stop']*100:.0f}%: n={m['n']} avg {m['mean']*100:+.3f}% win {m['win']*100:.0f}% t={m['t']:.1f} | 0.30% slip {m3['mean']*100:+.3f}% | first 2/3 {first:+.2f}% vs last {last:+.2f}%")
-            best=ranked[0]; bm,bm3=summarize([x for _,_,x in best[mid]]), summarize([x for _,_,x in best[hi]])
-            ts=sorted(best[mid]); cut=len(ts)*2//3; stable=sum(x for _,_,x in ts[:cut])>0 and sum(x for _,_,x in ts[cut:])>0
-            verdict=("POSSIBLE EDGE" if (bm3["mean"]>0 and bm["t"]>=2 and stable) else "NO EDGE")
-            tg(f"REVERSAL {DAYS}d BMT/CAT | {len(chosen)} events LONG after dump\nFee {FEE*100:.2f}%/side slip ranked 0.15%\n\n"+"\n".join(lines)+f"\n\nVERDICT: {verdict}")
+            for hold in HOLDS:
+              for slip in SLIPS:
+                results=[]
+                for ev,k in chosen:
+                  r=sim_avg_sl(k,ev["T"],ev["rate"],hold,slip)
+                  if r: results.append(r)  # (wallet_ret, stopped)
+                
+                if not results: continue
+                wallet_rets=[w for w,s in results]
+                m=dict(
+                  n=len(wallet_rets),
+                  mean=sum(wallet_rets)/len(wallet_rets),
+                  med=st.median(wallet_rets),
+                  win=sum(1 for x in wallet_rets if x>0)/len(wallet_rets),
+                  t=(sum(wallet_rets)/len(wallet_rets))/(st.pstdev(wallet_rets)/len(wallet_rets)**0.5) if len(wallet_rets)>1 and st.pstdev(wallet_rets)>0 else 0,
+                  worst=min(wallet_rets),
+                  stops=sum(1 for w,s in results if s)
+                )
+                lines.append((hold,slip,m))
+
+            lines=sorted(lines, key=lambda x: -x[2]["mean"])
+            out=[]
+            for hold,slip,m in lines:
+              out.append(f"AVG {hold}m SL -3% price/-15% wallet | slip {slip*100:.2f}%: WALLET avg {m['mean']*100:+.2f}% med {m['med']*100:+.2f}% win {m['win']*100:.0f}% worst {m['worst']*100:+.1f}% stops {m['stops']}/{m['n']} t={m['t']:.1f}")
+
+            # verdict
+            best=[x for x in lines if x[1]==0.0015]
+            if best:
+              bm=best[0][2]
+              worst_03=[x for x in lines if x[1]==0.003]
+              bm30=worst_03[0][2] if worst_03 else bm
+              verdict="POSSIBLE EDGE" if bm30["mean"]>0 and bm["t"]>1.5 and bm["stops"]/bm["n"]<0.15 else "NO EDGE or too many SL"
+            else:
+              verdict="NO DATA"
+
+            tg(f"FINAL: T-50s ENTER, AVG EXIT, SL -3%/-15% wallet @5x | {DAYS}d BMT/CAT {len(chosen)} events\nFunding 0.7% price = 3.5% wallet\n\n"+"\n".join(out[:6])+f"\n\nVERDICT: {verdict}\nMax loss per trade -16.5% wallet ( -3% + 0.3% slip ) x5")
 
           if __name__=="__main__": main()
           PYEOF
           python reversal_test.py
-
       - uses: actions/upload-artifact@v4
-        with:
-          name: reversal-results
-          path: reversal_results.csv
+        with: {name: reversal-results, path: reversal_results.csv}
