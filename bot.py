@@ -9,7 +9,7 @@ BASE = "https://contract.mexc.com/api/v1/contract"
 ENTRY_BEFORE = 35
 EXIT_AFTER = 3
 LEVERAGE = 3
-WALLET_PCT = 0.99  # Use 99% always
+WALLET_PCT = 0.99
 
 ex = ccxt.mexc({"apiKey":API_KEY,"secret":SECRET,"options":{"defaultType":"swap"},"enableRateLimit":True})
 
@@ -23,13 +23,12 @@ def bal():
 
 def check_book(sym, side, need):
     try:
-        ob = ex.fetch_order_book(sym, 50)  # deeper book for big wallets
+        ob = ex.fetch_order_book(sym, 50)
         asks, bids = ob["asks"], ob["bids"]
         if not asks or not bids: return False, 999, 0, 0
         best_ask, best_bid = asks[0][0], bids[0][0]
         spread = (best_ask-best_bid)/best_ask*100
         if spread > 0.15: return False, spread, 0, 0
-
         depth=0
         limit = best_ask*1.001 if side=="buy" else best_bid*0.999
         book = asks if side=="buy" else bids
@@ -37,10 +36,7 @@ def check_book(sym, side, need):
             if side=="buy" and pr>limit: break
             if side=="sell" and pr<limit: break
             depth+=pr*am
-        
-        # INFINITE FIX: depth must be 1.5x need, works for $10 or $10k
         if depth < need*1.5: return False, spread, depth, 0
-
         filled=cost=0
         for pr, am in book:
             if filled>=need: break
@@ -50,8 +46,7 @@ def check_book(sym, side, need):
         slip=abs(avg-(best_ask if side=="buy" else best_bid))/best_ask*100
         if slip>0.1: return False, spread, depth, slip
         return True, spread, depth, slip
-    except:
-        return False, 999, 0, 0
+    except: return False, 999, 0, 0
 
 def scan_best(next_slot, wallet):
     rows = get(f"{BASE}/ticker").get("data") or []
@@ -69,21 +64,20 @@ def scan_best(next_slot, wallet):
         except: continue
     if not cand: return None
     cand.sort(key=lambda x: -abs(x[1]))
-
     need = wallet*WALLET_PCT*LEVERAGE
     for sym_raw, rate, cyc in cand:
         sym=sym_raw.replace("_","/")+":USDT"
         side="sell" if rate>0 else "buy"
         ok, spread, depth, slip = check_book(sym, side, need)
-        if ok:
-            return (sym_raw, rate, cyc, spread, depth, slip), cand
-        else:
-            print(f"⏭️ Skip {sym_raw} {rate*100:+.2f}% spread {spread:.3f}% depth ${depth:.0f} < need ${need*1.5:.0f}")
+        if ok: return (sym_raw, rate, cyc, spread, depth, slip), cand
+        else: print(f"⏭️ Skip {sym_raw} {rate*100:+.2f}% depth ${depth:.0f} < ${need*1.5:.0f}")
     return None
 
 ex.load_markets()
-print(f"🤖 BOT V3.6 INFINITE | T-{ENTRY_BEFORE}s T+{EXIT_AFTER}s | 1 trade | {LEVERAGE}x {int(WALLET_PCT*100)}% | >=0.5% | Book+Slip | Killer -2% | 4h/8h | {'LIVE' if not DRY_RUN else 'DRY'}")
+start_bal = bal()
+print(f"🤖 BOT V3.7 COMPOUND | Start ${start_bal:.2f} | T-{ENTRY_BEFORE}s T+{EXIT_AFTER}s | {LEVERAGE}x {int(WALLET_PCT*100)}% COMPOUND | {'LIVE' if not DRY_RUN else 'DRY'}")
 
+trade_count = 0
 while True:
     now=datetime.now(timezone.utc)
     next_slot=None
@@ -96,30 +90,29 @@ while True:
     slot_name="BOTH 4H+8H" if dt.hour in [0,8,16] else "ONLY 4H"
     wait=next_slot-time.time()-ENTRY_BEFORE
     if wait>0:
-        # Show dynamic wallet
         w=bal()
-        print(f"Next {dt:%H:%M} UTC [{slot_name}] in {wait/60:.1f}min | Bal ${w:.2f} | Notional ${w*WALLET_PCT*LEVERAGE:.2f} | Entry T-{ENTRY_BEFORE}s")
+        growth = (w/start_bal*100-100) if start_bal>0 else 0
+        print(f"Next {dt:%H:%M} UTC [{slot_name}] in {wait/60:.1f}min | Bal ${w:.2f} | Trades {trade_count} | Growth {growth:+.2f}% | Notional ${w*WALLET_PCT*LEVERAGE:.2f}")
         time.sleep(wait-5 if wait>60 else wait)
     while time.time()<next_slot-ENTRY_BEFORE-0.2: time.sleep(0.05)
 
-    wallet=bal()
-    # INFINITE FIX: Only skip if balance is dust, not $5
-    if wallet < 1:
-        print(f"Balance ${wallet:.2f} dust - waiting deposit"); time.sleep(10); continue
+    wallet_before=bal()  # COMPOUND: fetch fresh balance every trade
+    if wallet_before < 1:
+        print(f"Dust ${wallet_before:.2f} waiting"); time.sleep(10); continue
 
-    result=scan_best(next_slot, wallet)
+    result=scan_best(next_slot, wallet_before)
     if not result:
-        print(f"❌ No >=0.5% liquid at {dt:%H:%M} [{slot_name}]"); time.sleep(10); continue
+        print(f"❌ No >=0.5% at {dt:%H:%M}"); time.sleep(10); continue
 
     (sym_raw, rate, cyc, spread, depth, slip), all_cand = result
     sym=sym_raw.replace("_","/")+":USDT"
     side="sell" if rate>0 else "buy"
     sname="SHORT" if rate>0 else "LONG"
-    need=wallet*WALLET_PCT*LEVERAGE
+    need=wallet_before*WALLET_PCT*LEVERAGE  # COMPOUND: 99% of CURRENT wallet
 
-    print(f"\n⏰ {dt:%H:%M} UTC [{slot_name}] | Wallet ${wallet:.2f} -> Notional ${need:.2f} ({LEVERAGE}x)")
-    print(f"Settling: {', '.join([f'{s} {r*100:+.2f}% {c}H' for s,r,c in all_cand[:5]])}")
-    print(f"🔥 PICK: {sym_raw} {rate*100:+.3f}% {cyc}H -> {sname} | Spread {spread:.3f}% Depth ${depth:.0f} Slip {slip:.3f}%")
+    print(f"\n⏰ {dt:%H:%M} UTC [{slot_name}] | COMPOUND Trade #{trade_count+1}")
+    print(f"Wallet BEFORE ${wallet_before:.2f} -> Notional ${need:.2f} = ${wallet_before:.2f} * {WALLET_PCT} * {LEVERAGE}x")
+    print(f"🔥 PICK: {sym_raw} {rate*100:+.3f}% -> {sname}")
 
     try:
         ex.set_leverage(LEVERAGE, sym, params={"openType":1,"positionType":2 if side=="sell" else 1})
@@ -135,13 +128,9 @@ while True:
             entry=float(pos[0]["entryPrice"]) if pos and pos[0].get("entryPrice") else best
             amt=float(pos[0]["contracts"]) if pos else amt
             sp=entry*0.98 if side=="buy" else entry*1.02
-            try:
-                ex.create_order(sym,"market","buy" if side=="sell" else "sell",amt,None,{"openType":1,"reduceOnly":True,"stopPrice":sp})
-                print(f"🛡️ STOP -2% at {sp:.6f}")
+            try: ex.create_order(sym,"market","buy" if side=="sell" else "sell",amt,None,{"openType":1,"reduceOnly":True,"stopPrice":sp})
             except: pass
         else: entry=best
-
-        print(f"🚀 ENTER T-{ENTRY_BEFORE}s @ {entry}")
 
         closed=False
         while time.time()<next_slot+EXIT_AFTER:
@@ -150,7 +139,7 @@ while True:
                 chg=(px-entry)/entry if side=="buy" else (entry-px)/entry
                 if chg<=-0.02 and not DRY_RUN and not closed:
                     ex.create_order(sym,"market","buy" if side=="sell" else "sell",amt,None,{"openType":1,"reduceOnly":True})
-                    closed=True; print(f"💥 KILLER -2% {chg*100:.2f}%"); break
+                    closed=True; break
             except: pass
             time.sleep(0.05)
 
@@ -160,9 +149,16 @@ while True:
             try: ex.cancel_all_orders(sym)
             except: pass
 
-        nb=bal()
-        gain=need*abs(rate); fee=need*0.0004; slip_cost=need*slip/100
-        print(f"💰 ${wallet:.2f} -> ${nb:.2f} | +${gain:.2f} fund -${fee:.2f} fee -${slip_cost:.2f} slip | Est +${gain-fee-slip_cost:.2f} | Real ${nb-wallet:+.4f} | Wallet {nb/wallet*100-100:+.2f}%\n")
+        wallet_after=bal()  # COMPOUND: new balance after trade
+        trade_count+=1
+        trade_pnl = wallet_after - wallet_before
+        total_growth = (wallet_after/start_bal*100-100) if start_bal>0 else 0
+        next_notional = wallet_after*WALLET_PCT*LEVERAGE
+
+        print(f"✅ CLOSE | COMPOUND RESULT")
+        print(f"   Before: ${wallet_before:.2f} | After: ${wallet_after:.2f} | Trade PnL ${trade_pnl:+.4f} ({trade_pnl/wallet_before*100:+.2f}%)")
+        print(f"   Start: ${start_bal:.2f} -> Now: ${wallet_after:.2f} | Total Growth {total_growth:+.2f}% | {trade_count} trades")
+        print(f"   NEXT trade notional will be ${next_notional:.2f} = ${wallet_after:.2f} * 0.99 * 3x (COMPOUNDED)\n")
 
     except Exception as e:
         print(f"Fail {sym_raw}: {e}")
