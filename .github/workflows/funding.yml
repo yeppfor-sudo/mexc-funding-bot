@@ -1,20 +1,15 @@
-name: funding
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '5 */6 * * *'
+name: funding-bot
+on: [push, workflow_dispatch]
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 370
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - run: pip install ccxt requests
-      - name: Run Bot V3
+      - run: python bot.py
         env:
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
           MEXC_SECRET: ${{ secrets.MEXC_SECRET }}
           LIVE: ${{ secrets.LIVE }}
-        run: python -u bot.py
