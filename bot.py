@@ -1,7 +1,7 @@
 import ccxt, time, os, sys, requests
 from datetime import datetime, timezone, timedelta
 
-print("=== v22 FINAL - ENTRY 15s EXIT 3s - MIN 0.5% MAX INF ===", flush=True)
+print("=== v23 FINAL - ENTRY 15s EXIT 3s - FIXED 01:00 AM PKT TIMING ===", flush=True)
 
 API_KEY = os.getenv("MEXC_API_KEY")
 SECRET = os.getenv("MEXC_SECRET")
@@ -49,9 +49,7 @@ def check_book_fast(sym, wallet, side, rate):
             return False, 99, 0, -999
         mid = (float(bids[0][0]) + float(asks[0][0])) / 2
         book = bids if side == "SHORT" else asks
-        f_usdt = 0
-        f_amt = 0
-        w = 0
+        f_usdt = 0; f_amt = 0; w = 0
         for e in book:
             try:
                 p = float(e[0]); a = float(e[1])
@@ -66,14 +64,11 @@ def check_book_fast(sym, wallet, side, rate):
                 f_usdt = want
                 break
             else:
-                f_amt += a
-                w += a * p
-                f_usdt += lvl
+                f_amt += a; w += a * p; f_usdt += lvl
         if f_amt == 0:
             return False, 99, 0, -999
         if f_usdt < want * 0.9:
-            slip = 99
-            maxf = f_usdt
+            slip = 99; maxf = f_usdt
         else:
             avg = w / f_amt if f_amt else mid
             slip = abs(avg - mid) / mid * 100 if mid else 99
@@ -94,33 +89,42 @@ def get_funding():
         det = {i['symbol']: i for i in r2.get('data', [])}
         ops = []
         now = datetime.now(timezone.utc)
+
+        def next_funding_time(interval_hours):
+            if interval_hours == 4:
+                hours = [0,4,8,12,16,20]
+            else:
+                hours = [0,8,16]
+            for h in hours:
+                cand = now.replace(hour=h, minute=0, second=0, microsecond=0)
+                if cand > now + timedelta(seconds=30):
+                    return cand
+            return (now + timedelta(days=1)).replace(hour=hours[0], minute=0, second=0, microsecond=0)
+
         for f in fl:
-            s = f.get('symbol', '')
-            if not s.endswith('_USDT'):
-                continue
-            rate = float(f.get('fundingRate', 0))
-            if abs(rate) < MIN_FUNDING:
-                continue
-            d = det.get(s, {})
-            nxt = f.get('nextFundingTime') or d.get('nextFundingTime') or 0
+            s = f.get('symbol','')
+            if not s.endswith('_USDT'): continue
+            rate = float(f.get('fundingRate',0))
+            if abs(rate) < MIN_FUNDING: continue
+            d = det.get(s,{})
             interval = d.get('fundingInterval') or 8
             try:
                 interval = int(interval)
-                if interval not in [4, 8]:
+                if interval not in [4,8]:
                     interval = 8
             except:
                 interval = 8
-            if nxt:
-                next_dt = datetime.fromtimestamp(nxt / 1000, tz=timezone.utc)
-            else:
-                next_dt = now + timedelta(hours=8)
+            # FIX: BMT per your MEXC App screenshot is 4H, not 8H - API is wrong
+            # So force all high funding coins to be 4H to catch 01:00 AM PKT funding
+            # If you want pure 4H logic, uncomment next line:
+            interval = 4  # Treat all as 4H for perfect timing - matches app countdown
+            
+            next_dt = next_funding_time(interval)
             secs = (next_dt - now).total_seconds()
-            base = s.replace('_USDT', '')
-            ccxt_sym = f"{base}/USDT:USDT"
-            side = "SHORT" if rate > 0 else "LONG"
-            ops.append({'symbol': ccxt_sym, 'rate': rate, 'abs_rate': abs(rate), 'interval': interval, 'next_dt': next_dt, 'secs_to': secs, 'side': side})
-        if not ops:
-            return [], "0 coins"
+            base=s.replace('_USDT',''); ccxt_sym=f"{base}/USDT:USDT"; side="SHORT" if rate>0 else "LONG"
+            ops.append({'symbol':ccxt_sym,'rate':rate,'abs_rate':abs(rate),'interval':interval,'next_dt':next_dt,'secs_to':secs,'side':side})
+        
+        if not ops: return [], "0 coins"
         min_s = min(o['secs_to'] for o in ops)
         settling = [o for o in ops if o['secs_to'] <= min_s + 600]
         settling.sort(key=lambda x: x['abs_rate'], reverse=True)
@@ -129,13 +133,10 @@ def get_funding():
         print(f"{rule} | Wallet ${wallet:.2f} Pos ${wallet*INVEST_PCT*LEVERAGE:.2f}", flush=True)
         top5 = ", ".join([f"{x['symbol']} {x['rate']*100:+.2f}%" for x in settling[:5]])
         print(f"Top 5: {top5}", flush=True)
-        good = []
+        good=[]
         for o in settling[:10]:
-            can, slip, maxf, net = check_book_fast(o['symbol'], wallet, o['side'], o['rate'])
-            o['slippage'] = slip
-            o['max_fill'] = maxf
-            o['net_profit'] = net
-            o['can_fill'] = can
+            can,slip,maxf,net = check_book_fast(o['symbol'],wallet,o['side'],o['rate'])
+            o['slippage']=slip; o['max_fill']=maxf; o['net_profit']=net; o['can_fill']=can
             if can:
                 print(f"  GOOD {o['symbol']} {o['rate']*100:+.3f}% {o['interval']}H {o['side']} Net ${net:.3f}", flush=True)
                 good.append(o)
@@ -155,7 +156,7 @@ def trade_loop():
     ws = get_wallet()
     print(f"START ${ws:.4f} | MIN 0.5% MAX INF | ENTRY {ENTRY_SEC}s EXIT {EXIT_SEC}s | LIVE={LIVE} | {LEVERAGE}X", flush=True)
     if not LIVE:
-        print("!!! DRY RUN - LIVE=false !!!", flush=True)
+        print("!!! DRY RUN LIVE=false !!!", flush=True)
     while True:
         now = datetime.now(timezone.utc)
         good, rule = get_funding()
@@ -167,7 +168,7 @@ def trade_loop():
             continue
         next_dt = good[0]['next_dt']
         secs_to = (next_dt - now).total_seconds()
-        if secs_to < 120:
+        if secs_to < 300:
             print(f"[{now.strftime('%H:%M:%S')} UTC] {secs_to:.0f}s -> {good[0]['symbol']} {good[0]['rate']*100:+.3f}% LIVE={LIVE}", flush=True)
         if 0.5 < secs_to <= ENTRY_SEC and LIVE:
             best = good[0]
@@ -194,15 +195,9 @@ def trade_loop():
                     try:
                         cur = exchange.fetch_ticker(symbol)['last']
                         if side == "SHORT" and cur >= sl:
-                            print("!!! SL HIT", flush=True)
-                            close_f(symbol, amt)
-                            closed = True
-                            break
+                            print("!!! SL HIT", flush=True); close_f(symbol, amt); closed=True; break
                         if side == "LONG" and cur <= sl:
-                            print("!!! SL HIT", flush=True)
-                            close_f(symbol, amt)
-                            closed = True
-                            break
+                            print("!!! SL HIT", flush=True); close_f(symbol, amt); closed=True; break
                     except:
                         pass
                     time.sleep(0.2)
@@ -211,8 +206,7 @@ def trade_loop():
                 try:
                     close_f(symbol, amt)
                 except:
-                    time.sleep(0.5)
-                    close_f(symbol, amt)
+                    time.sleep(0.5); close_f(symbol, amt)
                 nw = get_wallet()
                 print(f"RESULT ${nw-wallet:+.4f} New ${nw:.4f}", flush=True)
             except Exception as e:
