@@ -1,8 +1,8 @@
 name: funding-bot
-on: [push, workflow_dispatch]
-concurrency:
-  group: funding-bot-single
-  cancel-in-progress: true
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
 jobs:
   bot:
     runs-on: ubuntu-latest
@@ -10,9 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+        with:
+          python-version: '3.11'
       - run: pip install ccxt requests
-      - run: python bot.py
+      - run: python -u bot.py
         env:
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
           MEXC_SECRET: ${{ secrets.MEXC_SECRET }}
