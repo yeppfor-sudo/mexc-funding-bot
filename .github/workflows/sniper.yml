@@ -4,16 +4,16 @@ on:
     inputs:
       mode:
         description: "run or run_once or scan"
-        default: "run"
+        default: "run_once"
       dry_run:
-        description: "true/false"
+        description: "true/false - false=REAL MONEY"
         default: "false"
   schedule:
     - cron: "58 3,7,11,15,19,23 * * *"
 
 jobs:
   trade:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 370
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +22,7 @@ jobs:
         uses: fscarmen/warp-on-actions@v1.3
         with:
           stack: dual
+          mode: client
 
       - name: Python
         uses: actions/setup-python@v5
