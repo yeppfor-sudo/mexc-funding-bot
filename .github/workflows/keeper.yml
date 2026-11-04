@@ -1,0 +1,33 @@
+name: Keeper
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  keep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Ensure sniper is running
+        run: |
+          RUNS=$(gh run list --workflow sniper.yml --limit 20 --json status,startedAt)
+          ACTIVE=$(echo "$RUNS" | jq '[.[]|select(.status=="in_progress")]|length')
+          QUEUED=$(echo "$RUNS" | jq '[.[]|select(.status=="queued" or .status=="pending" or .status=="waiting")]|length')
+          START=$(echo "$RUNS" | jq -r '[.[]|select(.status=="in_progress")|.startedAt]|min // empty')
+          if [ "$QUEUED" -gt 0 ]; then echo "next run already queued"; exit 0; fi
+          if [ "$ACTIVE" -eq 0 ]; then
+            echo "no sniper running -> starting"; gh workflow run sniper.yml
+          else
+            AGE=$(( $(date +%s) - $(date -d "$START" +%s) ))
+            echo "sniper age ${AGE}s"
+            if [ "$AGE" -gt 18000 ]; then echo "queueing handover run"; gh workflow run sniper.yml; fi
+          fi
