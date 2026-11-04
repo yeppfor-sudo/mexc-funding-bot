@@ -3,13 +3,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "run or run_once or scan"
-        default: "run_once"
+        description: "scan or run_once or run"
+        default: "scan"
       dry_run:
-        description: "true/false - false=REAL MONEY"
+        description: "true/false"
         default: "false"
   schedule:
-    - cron: "58 23,7,15 * * *" # 3x daily 8h funding 00,08,16 UTC
+    - cron: "58 23,7,15 * * *"
 
 jobs:
   trade:
@@ -18,11 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fix GitHub IP banned by MEXC WAF
+      - name: Fix GitHub IP banned
         uses: fscarmen/warp-on-actions@v1.3
         with:
           stack: dual
           mode: client
+
+      - name: Wait WARP connect
+        run: sleep 15 && curl -s https://api.ipify.org && echo " WARP IP OK"
 
       - name: Python
         uses: actions/setup-python@v5
@@ -36,12 +39,5 @@ jobs:
         env:
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
           MEXC_API_SECRET: ${{ secrets.MEXC_API_SECRET }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LEVERAGE: "5"
-          MIN_RATE_PCT: "0.5"
-          ENTRY_PCT: "70"
-          DCA_PCT: "29"
-          RUN_SECONDS: "20700"
-          DRY_RUN: ${{ inputs.dry_run || 'false' }}
-        run: python bot.py ${{ inputs.mode || 'run_once' }}
+        run: python bot.py ${{ inputs.mode || 'scan' }}
