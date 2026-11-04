@@ -9,7 +9,7 @@ on:
         description: "true/false - false=REAL MONEY"
         default: "false"
   schedule:
-    - cron: "58 3,7,11,15,19,23 * * *"
+    - cron: "58 23,7,15 * * *" # 3x daily 8h funding 00,08,16 UTC
 
 jobs:
   trade:
@@ -38,10 +38,10 @@ jobs:
           MEXC_API_SECRET: ${{ secrets.MEXC_API_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DRY_RUN: ${{ inputs.dry_run || 'false' }}
           LEVERAGE: "5"
           MIN_RATE_PCT: "0.5"
           ENTRY_PCT: "70"
           DCA_PCT: "29"
           RUN_SECONDS: "20700"
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: python bot.py ${{ inputs.mode || 'run_once' }}
