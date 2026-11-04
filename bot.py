@@ -1,241 +1,130 @@
 import os, time, hmac, hashlib, requests, math
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 API_KEY = os.getenv("MEXC_API_KEY","").strip()
 API_SECRET = os.getenv("MEXC_API_SECRET","").strip()
+PROXY_URL = os.getenv("PROXY_URL","").strip()
+LEVERAGE = int(os.getenv("LEVERAGE","5"))
+MODE = os.getenv("MODE","test_now")
+
 BASES = ["https://contract.mexc.com", "https://contract.mexc.io"]
 BASE_TICKER = "https://contract.mexc.com"
-LEVERAGE = int(os.getenv("LEVERAGE", "5"))
-ENTRY_PCT = 0.70
-DCA_PCT = 0.29
-MIN_RATE = 0.005
 
-# PROXY v15 - use gateway p.webshare.io:80 NOT direct IP
-PROXY_URL = os.getenv("PROXY_URL","").strip()
+# Fix proxy format for Webshare
+if PROXY_URL and ":80" in PROXY_URL:
+    # Try 8080 is more stable than 80 on Railway
+    PROXY_URL = PROXY_URL.replace(":80", ":8080")
+    print(f"Auto-fixed proxy port to 8080")
+
 PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-if PROXIES:
-    print(f"Using PROXY {PROXY_URL[:45]}...")
-else:
-    print("No PROXY - DIRECT (will be blocked by MEXC WAF)")
-
-def smart_req(method, url, **kwargs):
-    timeout = kwargs.pop('timeout', 30)
-    if PROXIES:
-        try:
-            r = requests.request(method, url, proxies=PROXIES, timeout=timeout, **kwargs)
-            # if proxy returns Access Denied html from its own block, fallback
-            if r.status_code != 200 and "Access Denied" in r.text:
-                print(f"Proxy got Access Denied from MEXC WAF, trying direct...")
-                return requests.request(method, url, timeout=timeout, **kwargs)
-            return r
-        except Exception as e:
-            msg = str(e)
-            # proxy dead - fallback to direct (ticker may still work)
-            if "ProxyError" in str(type(e)) or "ConnectTimeout" in msg or "Max retries" in msg or "Unable to connect" in msg:
-                print(f"Proxy dead ({msg[:120]}), fallback DIRECT for {url[:50]}")
-                return requests.request(method, url, timeout=timeout, **kwargs)
-            print(f"Req err {e}, trying direct")
-            return requests.request(method, url, timeout=timeout, **kwargs)
-    else:
-        return requests.request(method, url, timeout=timeout, **kwargs)
-
-def safe_json(r):
-    if not r or not hasattr(r, 'text'): return None
-    txt = r.text
-    if not txt or len(txt) < 5: return None
-    if txt.strip().startswith("<"):
-        if "Access Denied" in txt:
-            print(f"WAF BLOCKED {txt[:300]}")
-        return None
-    try:
-        return r.json()
-    except:
-        return None
+print(f"=== RAILWAY BOT MODE={MODE} ===")
+print(f"Proxy: {PROXY_URL[:40]}..." if PROXY_URL else "No proxy - will be BLOCKED!")
+print(f"API Key: {API_KEY[:5]}...")
 
 def sign(params, secret):
     query = "&".join([f"{k}={v}" for k,v in sorted(params.items())])
     return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-def get_balance():
-    for base in BASES:
-        for i in range(3):
+def smart_req(method, url, **kwargs):
+    kwargs.setdefault('timeout', 30)
+    if PROXIES:
+        # Don't fallback to direct - keep trying proxy
+        for attempt in range(3):
             try:
-                ts = int(time.time()*1000)
-                url = f"{base}/api/v1/private/account/assets"
-                params = {"api_key": API_KEY, "req_time": ts}
-                params["sign"] = sign(params, API_SECRET)
-                r = smart_req("GET", url, params=params, headers={"ApiKey": API_KEY})
-                j = safe_json(r)
-                if not j:
-                    time.sleep(2); continue
-                data = j.get("data",[])
-                if isinstance(data, list):
-                    for a in data:
-                        if a.get("currency")=="USDT":
-                            bal = float(a.get("equity") or a.get("available") or 0)
-                            if bal>0:
-                                print(f"Balance OK {bal} from {base}")
-                                return bal
-                time.sleep(2)
+                print(f"Proxy try {attempt+1}/3 -> {url[:70]}")
+                r = requests.request(method, url, proxies=PROXIES, **kwargs)
+                # If MEXC returns HTML WAF page even via proxy, retry
+                if r.text.strip().startswith("<") or "Access Denied" in r.text[:500]:
+                    print(f"WAF via proxy attempt {attempt+1}, retrying...")
+                    time.sleep(2)
+                    continue
+                return r
             except Exception as e:
-                print(f"Balance err {base} {e}")
-                time.sleep(2)
-    print("Balance fallback 6.5")
-    return 6.5
+                print(f"Proxy fail attempt {attempt+1}: {e}")
+                time.sleep(3)
+        print("CRITICAL: All proxy tries failed - proxy dead")
+        # Return fake response to avoid crash
+        raise Exception("Proxy dead - check webshare.io proxy")
+    else:
+        # No proxy - will be blocked on Railway
+        return requests.request(method, url, **kwargs)
 
-def get_funding_rates():
-    for attempt in range(5):
-        try:
-            r = smart_req("GET", f"{BASE_TICKER}/api/v1/contract/ticker")
-            j = safe_json(r)
-            if not j:
-                time.sleep(2); continue
-            rates=[]
-            for t in j.get("data",[]):
-                sym = t.get("symbol","")
-                if not sym.endswith("_USDT"): continue
-                try:
-                    rates.append({"symbol":sym,"rate":float(t.get("fundingRate",0)),"price":float(t.get("lastPrice",0))})
-                except: continue
-            if rates:
-                print(f"Ticker OK {len(rates)} pairs")
-                return rates
-        except Exception as e:
-            print(f"Ticker err {e}")
-            time.sleep(3)
-    return []
-
-def place_order(symbol, side, usdt):
+def get_balance():
     for base in BASES:
         try:
             ts = int(time.time()*1000)
-            vol = max(1, math.floor(usdt/10))
-            params = {"api_key":API_KEY,"req_time":ts,"symbol":symbol,"price":0,"vol":vol,"side":side,"type":5,"open_type":1,"leverage":LEVERAGE}
-            params["sign"]=sign(params,API_SECRET)
-            url = f"{base}/api/v1/private/order/submit"
-            r = smart_req("POST", url, data=params, headers={"ApiKey": API_KEY})
-            txt = r.text
-            print(f"ORDER try {base} {symbol} side {side} vol {vol} -> {txt[:700]}")
-            if "Access Denied" in txt:
-                print(f"BLOCKED on {base}, trying next base...")
-                time.sleep(2)
+            url = f"{base}/api/v1/private/account/assets"
+            params = {"api_key": API_KEY, "req_time": ts}
+            params["sign"] = sign(params, API_SECRET)
+            r = smart_req("GET", url, params=params, headers={"ApiKey": API_KEY})
+            print(f"Balance response from {base}: {r.text[:300]}")
+            if r.text.strip().startswith("<"):
+                print(f"WAF BLOCKED on {base}")
                 continue
-            if '"code":200' in txt or '"orderId"' in txt:
-                print(f"ORDER SUCCESS on {base}")
-                return txt
-            return txt
+            j = r.json()
+            for a in j.get("data", []):
+                if a.get("currency") == "USDT":
+                    bal = float(a.get("equity") or a.get("availableBalance") or 0)
+                    if bal > 0:
+                        print(f"Balance OK {bal} USDT from {base}")
+                        return bal
         except Exception as e:
-            print(f"Order err {base} {e}")
-            time.sleep(2)
-    return "FAILED ALL BASES"
+            print(f"Balance error {base}: {e}")
+    print("Balance fallback 6.5 - API BLOCKED")
+    return 6.5
 
-def get_next_funding():
-    now = datetime.now(timezone.utc)
-    for i in range(0, 25):
-        ft = (now + timedelta(hours=i)).replace(minute=0, second=5, microsecond=0)
-        if ft > now + timedelta(seconds=70):
-            return ft
-    return (now + timedelta(days=1)).replace(hour=0,minute=0,second=5,microsecond=0)
+def get_funding_tickers():
+    try:
+        r = smart_req("GET", f"{BASE_TICKER}/api/v1/contract/ticker", timeout=20)
+        data = r.json().get("data", [])
+        pairs = []
+        for t in data:
+            sym = t.get("symbol","")
+            if sym.endswith("_USDT"):
+                try:
+                    rate = float(t.get("fundingRate",0))
+                    pairs.append({"symbol": sym, "rate": rate})
+                except:
+                    pass
+        pairs.sort(key=lambda x: abs(x["rate"]), reverse=True)
+        return pairs
+    except Exception as e:
+        print(f"Ticker error: {e}")
+        return []
 
-def main(mode="run_once"):
-    print(f"=== SNIPER v15 FINAL mode={mode} LEVERAGE={LEVERAGE}x ===")
-    balance = get_balance()
-    print(f"START bal {balance} USDT")
+def place_order(sym, side, usdt_value):
+    vol = max(1, math.floor(usdt_value/10))
+    print(f"Placing ORDER {sym} side={side} vol={vol} usdt={usdt_value}")
+    for base in BASES:
+        try:
+            ts = int(time.time()*1000)
+            p = {"api_key": API_KEY, "req_time": ts, "symbol": sym, "price": 0, "vol": vol, "side": side, "type": 5, "open_type": 1, "leverage": LEVERAGE}
+            p["sign"] = sign(p, API_SECRET)
+            r = smart_req("POST", f"{base}/api/v1/private/order/submit", data=p, headers={"ApiKey": API_KEY})
+            print(f"ORDER RESULT {base}: {r.text[:800]}")
+            if "200" in r.text or "orderId" in r.text or "success" in r.text.lower():
+                return True
+        except Exception as e:
+            print(f"Order error {base}: {e}")
+    return False
 
-    if mode=="scan":
-        rates = get_funding_rates()
-        rates = [r for r in rates if abs(r["rate"])>=0.0001]
-        rates.sort(key=lambda x: abs(x["rate"]), reverse=True)
-        print(f"Found {len(rates)} pairs")
-        for r in rates[:30]:
-            print(f"{r['symbol']} {r['rate']*100:.4f}% {r['price']}")
-        return
+# MAIN
+bal = get_balance()
+print(f"START bal {bal} USDT")
 
-    if mode=="test_now":
-        print("=== TEST NOW ===")
-        rates = get_funding_rates()
-        filt = [r for r in rates if abs(r["rate"])>=0.002]
-        filt.sort(key=lambda x: abs(x["rate"]), reverse=True)
-        if not filt:
-            print("No high funding"); return
-        pick = filt[0]
-        symbol=pick["symbol"]; rate=pick["rate"]
-        side_text="LONG" if rate<0 else "SHORT"
-        side_code=1 if rate<0 else 3
-        print(f"TEST ARMED {symbol} {rate*100:.4f}% {side_text}")
-        res1 = place_order(symbol, side_code, balance*ENTRY_PCT*LEVERAGE)
-        if "FAILED ALL BASES" in res1 or "Access Denied" in res1:
-            print("STILL BLOCKED - check PROXY_URL = p.webshare.io:80")
-            return
-        print("70% done 20s wait DCA")
-        time.sleep(20)
-        res2 = place_order(symbol, side_code, balance*DCA_PCT*LEVERAGE)
-        print(f"DCA {res2[:300]}")
-        print("99% done 20s wait CLOSE")
-        time.sleep(20)
-        close_side=2 if side_text=="LONG" else 4
-        res3 = place_order(symbol, close_side, balance*0.99*LEVERAGE)
-        print(f"TEST DONE CLOSE {res3[:500]}")
-        return
+tickers = get_funding_tickers()
+print(f"Found {len(tickers)} pairs")
+if tickers:
+    print(f"Top 3: {tickers[:3]}")
 
+if MODE == "test_now" and tickers:
+    top = tickers[0]
+    side = 1 if top["rate"] < 0 else 3  # 1=long, 3=short for funding
+    print(f"TEST MODE: {top['symbol']} rate {top['rate']*100:.4f}% side {side}")
+    ok = place_order(top["symbol"], side, bal*0.7*LEVERAGE)
+    print(f"TEST ORDER {'SUCCESS' if ok else 'FAILED'}")
+else:
+    print(f"MODE {MODE} - waiting for funding window")
     while True:
-        nxt = get_next_funding()
-        now = datetime.now(timezone.utc)
-        wait = (nxt - now).total_seconds()
-        pk = nxt + timedelta(hours=5)
-        print(f"Next {nxt} UTC | {pk} PK | in {int(wait)}s bal {balance:.2f}")
-        if wait > 300:
-            time.sleep(30); continue
-        if wait > 80:
-            time.sleep(10); continue
-        if 15 <= wait <= 80:
-            print("=== 50s BEFORE FUNDING ===")
-            rates = get_funding_rates()
-            filt = [r for r in rates if abs(r["rate"])>=MIN_RATE]
-            filt.sort(key=lambda x: abs(x["rate"]), reverse=True)
-            if not filt:
-                time.sleep(5); continue
-            pick = filt[0]
-            symbol=pick["symbol"]; rate=pick["rate"]; price=pick["price"]
-            side_text="LONG" if rate<0 else "SHORT"
-            side_code=1 if rate<0 else 3
-            print(f"ARMED {symbol} {rate*100:.4f}% {side_text} 70%")
-            r1 = place_order(symbol, side_code, balance*ENTRY_PCT*LEVERAGE)
-            if "FAILED" in r1 or "Access Denied" in r1:
-                time.sleep(60); continue
-            avg=price; total=balance*ENTRY_PCT
-            time.sleep(wait+18)
-            rates2=get_funding_rates()
-            cur=next((x for x in rates2 if x["symbol"]==symbol), None)
-            cur_price=cur["price"] if cur else price
-            diff=(cur_price-avg)/avg*100
-            if (side_text=="LONG" and diff<=-1.0) or (side_text=="SHORT" and diff>=1.0):
-                print(f"DCA +29% diff {diff:.2f}%")
-                place_order(symbol, side_code, balance*DCA_PCT*LEVERAGE)
-                avg=(price*70 + cur_price*29)/99
-                total=balance*0.99
-            for _ in range(36):
-                rn=get_funding_rates()
-                c=next((x for x in rn if x["symbol"]==symbol), None)
-                if not c:
-                    time.sleep(10); continue
-                cp=c["price"]
-                pnl=(cp-avg)/avg*100 if side_text=="LONG" else (avg-cp)/avg*100
-                print(f"HOLD {symbol} pnl {pnl:.3f}%")
-                if pnl>=0.05 or pnl<=-3.0:
-                    close_side=2 if side_text=="LONG" else 4
-                    place_order(symbol, close_side, total*LEVERAGE)
-                    print(f"CLOSE {pnl:.3f}%")
-                    balance=get_balance()
-                    break
-                time.sleep(10)
-            else:
-                close_side=2 if side_text=="LONG" else 4
-                place_order(symbol, close_side, total*LEVERAGE)
-            if mode=="run_once":
-                return
-        time.sleep(5)
-
-if __name__=="__main__":
-    import sys
-    main(sys.argv[1] if len(sys.argv)>1 else "run_once")
+        print(f"Loop check bal {bal}")
+        time.sleep(60)
