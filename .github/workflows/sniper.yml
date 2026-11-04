@@ -12,9 +12,6 @@ jobs:
     timeout-minutes: 370
     steps:
       - uses: actions/checkout@v4
-      
-      # NO WARP WHEN USING PROXY - WARP blocks proxy!
-      
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
