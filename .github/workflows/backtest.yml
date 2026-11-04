@@ -1,0 +1,43 @@
+name: Backtest (30 days, real MEXC data)
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Days to backtest"
+        default: "30"
+      start_equity:
+        description: "Starting USDT"
+        default: "100"
+      slippage_pct:
+        description: "Assumed slippage per fill (%)"
+        default: "0.05"
+      cycles:
+        description: "Funding cycles in hours (4 or 1,4,8)"
+        default: "4"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-backtest.txt
+      - run: pip install -r requirements-backtest.txt
+      - name: Run backtest
+        env:
+          DAYS: ${{ inputs.days }}
+          START_EQUITY: ${{ inputs.start_equity }}
+          SLIPPAGE_PCT: ${{ inputs.slippage_pct }}
+          FUNDING_CYCLES_HOURS: ${{ inputs.cycles }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python backtest.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: results/
