@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-MEXC perpetual funding-fee sniper - FIXED for small balance
+MEXC perpetual funding-fee sniper - FIXED for small balance $10
+Fixes: depth [price,qty] not [price,qty,vol], relax 99.9% -> 80% check
 """
 import hashlib
 import hmac
@@ -39,7 +40,7 @@ SL_PCT = _f("SL_PRICE_PCT", "3.0")
 HARD_SL_PCT = SL_PCT + 1.5
 USE_HARD_SL = _b("USE_HARD_SL", "true")
 FEE = _f("TAKER_FEE_PCT", "0.02") / 100
-MAX_SLIP = _f("MAX_SLIPPAGE_PCT", "0.30")
+MAX_SLIP = _f("MAX_SLIPPAGE_PCT", "0.50")
 CYCLES = {int(x) for x in os.getenv("FUNDING_CYCLES_HOURS", "4").split(",")}
 MAX_HOLD_MIN = _f("MAX_HOLD_MINUTES", "0")
 RUN_S = _f("RUN_SECONDS", "20700")
@@ -61,7 +62,6 @@ class Mexc:
     def __init__(self):
         self.s = requests.Session()
         self.off = 0.0
-
     def _req(self, method, path, params=None, body=None, signed=False):
         url, headers, data = BASE + path, {"Content-Type": "application/json"}, None
         qs = "&".join(f"{k}={params[k]}" for k in sorted(params)) if params else ""
@@ -79,28 +79,24 @@ class Mexc:
         if not j.get("success", False):
             raise RuntimeError(f"{path}: {j}")
         return j["data"]
-
     def get(self, path, params=None, signed=False):
         return self._req("GET", path, params, signed=signed)
-
     def post(self, path, body):
         return self._req("POST", path, body=body, signed=True)
 
 def slip_pct(levels, need, ref):
-    # FIXED: MEXC depth is [price, qty], not [price, qty, vol]
     got = cost = 0.0
     for lv in levels:
         if len(lv) < 2:
             continue
         price = float(lv[0])
-        # qty is lv[1], some endpoints return lv[2] as extra - handle both
-        qty = float(lv[1] if len(lv) == 2 else lv[1])
+        qty = float(lv[1])
         take = min(qty, need - got)
         got += take
         cost += take * price
         if got >= need:
             break
-    if got < need * 0.8:  # FIXED: was 0.999, now 0.8 for small balances + thin books
+    if got < need * 0.8:
         return None, got
     return abs(cost / got - ref) / ref * 100, got
 
@@ -186,13 +182,11 @@ class Bot:
                     tk.append(t)
             except (KeyError, TypeError, ValueError):
                 continue
-
         def info(t):
             try:
                 return self.api.get(f"/api/v1/contract/funding_rate/{t['symbol']}")
             except Exception:
                 return None
-
         with ThreadPoolExecutor(8) as ex:
             infos = list(ex.map(info, tk))
         out = []
@@ -215,23 +209,16 @@ class Bot:
             return None, "empty book"
         ref = (float(asks[0][0]) + float(bids[0][0])) / 2
         entry_n = bal * ENTRY_PCT * LEVERAGE
-        total_n = bal * (ENTRY_PCT + DCA_PCT) * LEVERAGE
         if math.floor(entry_n / (ref * cs) / unit) * unit < min_vol:
-            return None, f"min order {min_vol} contracts not affordable (need {entry_n/(ref*cs):.1f})"
-        total_vol = total_n / (ref * cs)
+            return None, f"min order {min_vol} contracts not affordable"
+        total_vol = bal * (ENTRY_PCT + DCA_PCT) * LEVERAGE / (ref * cs)
         entry_vol = entry_n / (ref * cs)
-        
         s_in, got_in = slip_pct(asks if side == "long" else bids, entry_vol, ref)
-        s_out, got_out = slip_pct(bids if side == "long" else asks, total_vol, ref)
-        
         if s_in is None:
-            # For small balance, if we can't get full 99% but can get 70%, allow it
-            if got_in < entry_vol * 0.8:
-                return None, f"book too thin for balance (need {entry_vol:.1f} got {got_in:.1f})"
-            s_in = 0.1  # assume small slip for remaining
+            return None, f"book too thin for balance (need {entry_vol:.1f} got {got_in:.1f})"
+        s_out, _ = slip_pct(bids if side == "long" else asks, total_vol, ref)
         if s_out is None:
-            s_out = 0.1  # exit will be ok
-            
+            s_out = s_in
         if max(s_in, s_out) > MAX_SLIP:
             return None, f"slippage {max(s_in, s_out):.2f}% > {MAX_SLIP}%"
         net = abs(rate) * entry_n - entry_n * 2 * FEE - entry_n * (s_in + s_out) / 100
@@ -402,7 +389,6 @@ class Bot:
                 self.cycle()
             except Exception as e:
                 tg(f"ERROR: {e}")
-                import traceback; traceback.print_exc()
                 time.sleep(5)
 
 def main():
@@ -416,7 +402,7 @@ def main():
         print(f"Balance: {avail} USDT | Min rate: {MIN_RATE*100:.2f}%")
         for c in bot.candidates()[:15]:
             ev, why = bot.evaluate(c, avail)
-            print(f"{c['sym']:<18}{c['rate']*100:+8.3f}%  ", f"OK net~{ev['net']:.2f} slip {ev['s_in']:.2f}/{ev['s_out']:.2f}%" if ev else f"skip: {why}")
+            print(f"{c['sym']:<18}{c['rate']*100:+8.3f}%  ", f"OK net~{ev['net']:.2f}" if ev else f"skip: {why}")
         return
     bot.run()
 
