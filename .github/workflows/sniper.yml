@@ -3,13 +3,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "scan or run_once or run"
-        default: "scan"
-      dry_run:
-        description: "true/false"
-        default: "false"
+        description: "scan or run_once or test_now"
+        default: "run_once"
   schedule:
-    - cron: "58 23,7,15 * * *"
+    - cron: "58 */1 * * *" # every hour check
 
 jobs:
   trade:
@@ -17,27 +14,22 @@ jobs:
     timeout-minutes: 370
     steps:
       - uses: actions/checkout@v4
-
       - name: Fix GitHub IP banned
         uses: fscarmen/warp-on-actions@v1.3
         with:
           stack: dual
           mode: client
-
-      - name: Wait WARP connect
-        run: sleep 15 && curl -s https://api.ipify.org && echo " WARP IP OK"
-
+      - name: Wait WARP
+        run: sleep 15 && curl -s https://api.ipify.org; echo " WARP OK"
       - name: Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install
         run: pip install -r requirements.txt
-
       - name: Run
         env:
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
           MEXC_API_SECRET: ${{ secrets.MEXC_API_SECRET }}
           LEVERAGE: "5"
-        run: python bot.py ${{ inputs.mode || 'scan' }}
+        run: python bot.py ${{ inputs.mode || 'run_once' }}
