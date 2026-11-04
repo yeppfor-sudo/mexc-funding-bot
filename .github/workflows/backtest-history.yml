@@ -1,0 +1,191 @@
+name: backtest-history-real
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Symbol or ALL'
+        default: 'BMT_USDT'
+      days:
+        default: '30'
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install requests ccxt pandas
+
+      - name: Backtest Funding History
+        env:
+          SYMBOL: ${{ inputs.symbol }}
+          DAYS: ${{ inputs.days }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          cat > hist.py << 'PYEOF'
+          import requests, time, os, csv, statistics
+          from datetime import datetime
+          SYMBOL=os.getenv("SYMBOL","BMT_USDT")
+          DAYS=int(os.getenv("DAYS","30"))
+          MIN_F=0.005
+          BASE="https://contract.mexc.com/api/v1/contract"
+          HDR={"User-Agent":"Mozilla/5.0", "Content-Type":"application/json"}
+
+          def pub(path, params=None):
+              for base in [BASE, "https://futures.mexc.com/api/v1/contract"]:
+                  try:
+                      r=requests.get(f"{base}{path}", params=params, timeout=15, headers=HDR)
+                      j=r.json()
+                      if j: return j
+                  except: continue
+              return {}
+
+          def get_history_real(sym, days):
+              events=[] # (timestamp_ms, rate)
+              # Method 1: funding_rate_history endpoint
+              try:
+                  j=pub(f"/funding_rate_history/{sym}", {"page_size": 500})
+                  data=j.get("data",[])
+                  if isinstance(data, dict): data=data.get("resultList",[])
+                  print(f"{sym} raw history count {len(data)}")
+                  for row in data:
+                      try:
+                          rate=float(row.get("fundingRate",0))
+                          settle=int(row.get("settleTime",0))
+                          if abs(rate)>=MIN_F and settle>0:
+                              # filter days
+                              if settle >= int((time.time()-days*86400)*1000):
+                                  events.append((settle, rate))
+                      except: continue
+              except Exception as e:
+                  print(f"History API fail {e}")
+
+              # Method 2: CCXT fallback
+              if not events:
+                  try:
+                      import ccxt
+                      ex=ccxt.mexc({'enableRateLimit':True})
+                      since=int((time.time()-days*86400)*1000)
+                      hist=ex.fetch_funding_rate_history(f"{sym.replace('_','/')}", since=since, limit=500)
+                      for h in hist:
+                          rate=float(h.get('fundingRate',0))
+                          ts=int(h.get('timestamp',0))
+                          if abs(rate)>=MIN_F:
+                              events.append((ts, rate))
+                      print(f"{sym} CCXT found {len(events)} events")
+                  except Exception as e:
+                      print(f"CCXT fail {e}")
+              return sorted(events)
+
+          def klines(sym, start_ms, end_ms):
+              j=pub(f"/kline/{sym}", {"interval":"Min1","start":start_ms,"end":end_ms})
+              return j.get("data",[]) if isinstance(j,dict) and "data" in j else []
+
+          def get_all_perps():
+              j=pub("/detail")
+              return [d["symbol"] for d in j.get("data",[]) if d.get("symbol","").endswith("_USDT")]
+
+          # 1. Get symbols
+          if SYMBOL=="ALL":
+              syms=get_all_perps()
+              syms=syms[:100] # limit for speed
+          else:
+              syms=[SYMBOL]
+
+          all_trades=[]
+          summary=[]
+          for sym in syms:
+              events=get_history_real(sym, DAYS)
+              # Filter only >=0.5%
+              events=[(ts,r) for ts,r in events if abs(r)>=MIN_F]
+              print(f"\n=== {sym} {len(events)} events >=0.5% in {DAYS}d ===")
+              if not events:
+                  print(f"No events >=0.5% for {sym}")
+                  continue
+
+              trades_pnl=[]
+              for ts, rate in events:
+                  side="long" if rate<0 else "short"
+                  ks=klines(sym, ts-6*60*1000, ts+7*60*1000)
+                  if len(ks)<4: continue
+                  entry=None; prices=[]
+                  for k in ks:
+                      kts=k[0]; close=float(k[4])
+                      if kts>=ts-60000 and kts<=ts-40000: entry=close
+                      if kts>=ts and kts<=ts+5*60*1000: prices.append(close)
+                  if not entry or not prices: continue
+
+                  # V2.1 strategy 70% + 29% DCA 1-1.5%
+                  avg=entry
+                  dca=False; dca_price=None
+                  if side=="long":
+                      low=min(prices)
+                      drop=(avg-low)/avg
+                      if 0.01 <= drop <= 0.015 or drop>=0.012:
+                          dca_price=low; avg=(entry*0.70 + low*0.29)/0.99; dca=True
+                  else:
+                      high=max(prices)
+                      drop=(high-avg)/avg
+                      if 0.01 <= drop <= 0.015 or drop>=0.012:
+                          dca_price=high; avg=(entry*0.70 + high*0.29)/0.99; dca=True
+
+                  sl=avg*0.97 if side=="long" else avg*1.03
+                  exit_p=None; reason="AVG EXIT"
+                  for p in prices:
+                      if side=="long" and p<=sl: exit_p=p; reason="SL -3% (-15% wallet)"; break
+                      if side=="short" and p>=sl: exit_p=p; reason="SL -3%"; break
+                  if not exit_p:
+                      exit_p=avg*1.0008 if side=="long" else avg*0.9992
+
+                  price_pnl=(exit_p-avg)/avg if side=="long" else (avg-exit_p)/avg
+                  fee=0.0004+0.0002 # maker+taker approx
+                  total=price_pnl - fee + abs(rate)
+                  wallet=total*5
+
+                  trades_pnl.append(wallet*100)
+                  all_trades.append({
+                      "symbol":sym,
+                      "funding_time":datetime.utcfromtimestamp(ts/1000).strftime("%Y-%m-%d %H:%M"),
+                      "rate":f"{rate*100:.4f}%",
+                      "side":side,
+                      "entry_70":entry,
+                      "dca_29":dca_price if dca else "",
+                      "avg":avg,
+                      "sl":sl,
+                      "exit":exit_p,
+                      "reason":reason,
+                      "wallet_pnl":f"{wallet*100:.3f}%"
+                  })
+
+              if trades_pnl:
+                  avg_w=statistics.mean(trades_pnl)
+                  win=len([x for x in trades_pnl if x>0])/len(trades_pnl)*100
+                  bal=10
+                  for p in trades_pnl: bal*=(1+p/100)
+                  summary.append((sym, len(events), avg_w, win, bal))
+                  print(f"{sym} {len(events)} trades avg {avg_w:+.3f}% win {win:.0f}% $10->{bal:.2f}")
+
+          # Save
+          os.makedirs("logs", exist_ok=True)
+          import csv
+          with open("logs/history_full_trades.csv","w", newline="") as f:
+              if all_trades:
+                  w=csv.DictWriter(f, fieldnames=all_trades[0].keys())
+                  w.writeheader(); w.writerows(all_trades)
+          with open("logs/history_summary.csv","w", newline="") as f:
+              w=csv.writer(f)
+              w.writerow(["symbol","trades>=0.5%","avg_wallet","winrate","$10_final"])
+              for s in sorted(summary, key=lambda x: x[4], reverse=True):
+                  w.writerow([s[0], s[1], f"{s[2]:.3f}%", f"{s[3]:.1f}%", f"${s[4]:.2f}"])
+
+          print(f"DONE {len(all_trades)} trades")
+          PYEOF
+          python hist.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: history-backtest
+          path: logs/
