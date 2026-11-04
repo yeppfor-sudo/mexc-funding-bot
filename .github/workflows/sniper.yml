@@ -4,9 +4,9 @@ on:
     inputs:
       mode:
         description: "scan or run_once or test_now"
-        default: "run_once"
+        default: "test_now"
   schedule:
-    - cron: "58 */1 * * *" # every hour check
+    - cron: "58 * * * *"
 
 jobs:
   trade:
@@ -14,22 +14,34 @@ jobs:
     timeout-minutes: 370
     steps:
       - uses: actions/checkout@v4
-      - name: Fix GitHub IP banned
+
+      - name: STRONG WARP for private API
         uses: fscarmen/warp-on-actions@v1.3
         with:
           stack: dual
           mode: client
-      - name: Wait WARP
-        run: sleep 15 && curl -s https://api.ipify.org; echo " WARP OK"
-      - name: Python
+          allow-bypass: true
+          check-ip: true
+
+      - name: Verify WARP IP
+        run: |
+          sleep 12
+          echo "My IP:"
+          curl -s https://api.ipify.org; echo ""
+          echo "Ticker check:"
+          curl -s -o /dev/null -w "%{http_code}" https://contract.mexc.com/api/v1/contract/ticker; echo " <- must be 200"
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install
-        run: pip install -r requirements.txt
-      - name: Run
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run Bot
         env:
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
           MEXC_API_SECRET: ${{ secrets.MEXC_API_SECRET }}
           LEVERAGE: "5"
-        run: python bot.py ${{ inputs.mode || 'run_once' }}
+        run: python bot.py ${{ inputs.mode || 'test_now' }}
