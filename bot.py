@@ -1,249 +1,166 @@
 import os, time, hmac, hashlib, requests, json
 from datetime import datetime, timezone, timedelta
-import math
+import math, traceback
 
-API_KEY = os.getenv("MEXC_API_KEY")
-API_SECRET = os.getenv("MEXC_API_SECRET")
+API_KEY = os.getenv("MEXC_API_KEY","").strip()
+API_SECRET = os.getenv("MEXC_API_SECRET","").strip()
 BASE = "https://contract.mexc.com"
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))
-ENTRY_PCT = float(os.getenv("ENTRY_PCT", "70")) / 100  # 70%
-DCA_PCT = float(os.getenv("DCA_PCT", "29")) / 100  # 29%
-MIN_RATE = float(os.getenv("MIN_RATE_PCT", "0.5")) / 100
-RUN_SECONDS = int(os.getenv("RUN_SECONDS", "20700"))  # 5h45m for mode=run
+ENTRY_PCT = 0.70
+DCA_PCT = 0.29
+MIN_RATE = 0.005
 
-# Telegram
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
-
-def tg(msg):
-    if not TG_TOKEN or not TG_CHAT: return
-    try: requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-        json={"chat_id": TG_CHAT, "text": msg}, timeout=5)
-    except: pass
+def safe_json(r):
+    txt = r.text
+    if not txt or len(txt) < 5:
+        print(f"EMPTY response status {r.status_code}")
+        return None
+    if txt.strip().startswith("<"):
+        print(f"HTML BLOCKED: {txt[:300]}")
+        return None
+    try:
+        return r.json()
+    except Exception as e:
+        print(f"JSON fail: {txt[:500]} err {e}")
+        return None
 
 def sign(params, secret):
     query = "&".join([f"{k}={v}" for k,v in sorted(params.items())])
     return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 def get_balance():
-    url = f"{BASE}/api/v1/private/account/assets"
-    ts = int(time.time()*1000)
-    params = {"api_key": API_KEY, "req_time": ts}
-    params["sign"] = sign(params, API_SECRET)
-    r = requests.get(url, params=params, headers={"ApiKey": API_KEY}, timeout=10)
-    data = r.json()
-    # MEXC returns equity in USDT
-    try:
-        for asset in data["data"]:
-            if asset["currency"] == "USDT":
-                return float(asset["equity"])
-    except:
-        print("BALANCE RAW:", data)
-    return 0.0
-
-def get_all_perp():
-    # 1. Scan all perpetual
-    url = f"{BASE}/api/v1/contract/detail"
-    r = requests.get(url, timeout=15).json()
-    contracts = [c for c in r["data"] if c["symbol"].endswith("_USDT")]
-    return contracts
+    for i in range(5):
+        try:
+            ts = int(time.time()*1000)
+            url = f"{BASE}/api/v1/private/account/assets"
+            params = {"api_key": API_KEY, "req_time": ts}
+            params["sign"] = sign(params, API_SECRET)
+            r = requests.get(url, params=params, headers={"ApiKey": API_KEY}, timeout=20)
+            j = safe_json(r)
+            if not j:
+                time.sleep(3); continue
+            print(f"Balance OK: {j}")
+            data = j.get("data",[])
+            if isinstance(data, list):
+                for a in data:
+                    if a.get("currency")=="USDT":
+                        return float(a.get("equity") or a.get("available") or 6.5)
+            return 6.5
+        except Exception as e:
+            print(f"Balance exception {e}\n{traceback.format_exc()}")
+            time.sleep(3)
+    print("Balance fallback 6.5")
+    return 6.5
 
 def get_funding_rates():
-    url = f"{BASE}/api/v1/contract/funding_rate"
-    # MEXC needs symbol by symbol, so we use ticker endpoint with funding
-    # Faster: get all tickers
-    ticker_url = f"{BASE}/api/v1/contract/ticker"
-    r = requests.get(ticker_url, timeout=15).json()
-    rates = []
-    for t in r["data"]:
+    for i in range(3):
         try:
-            sym = t["symbol"]
-            if not sym.endswith("_USDT"): continue
-            rate = float(t.get("fundingRate", 0))
-            rates.append({"symbol": sym, "rate": rate, "price": float(t["lastPrice"])})
-        except: continue
-    return rates
+            r = requests.get(f"{BASE}/api/v1/contract/ticker", timeout=20)
+            j = safe_json(r)
+            if not j: 
+                time.sleep(2); continue
+            rates=[]
+            for t in j.get("data",[]):
+                sym = t.get("symbol","")
+                if not sym.endswith("_USDT"): continue
+                try:
+                    rates.append({"symbol":sym,"rate":float(t.get("fundingRate",0)),"price":float(t.get("lastPrice",0))})
+                except: continue
+            if rates: return rates
+        except Exception as e:
+            print(f"Ticker err {e}")
+            time.sleep(2)
+    return []
 
-def get_orderbook(symbol):
-    url = f"{BASE}/api/v1/contract/depth/{symbol}"
-    r = requests.get(url, params={"limit": 20}, timeout=10).json()
-    return r["data"]
-
-def check_depth_ok(symbol, usdt_needed, price):
-    # 3. Check order book according to balance ♾️
+def place_order(symbol, side, usdt):
     try:
-        book = get_orderbook(symbol)
-        bids_vol = sum([float(x[1])*float(x[0]) for x in book["bids"][:10]]) # USDT depth
-        asks_vol = sum([float(x[1])*float(x[0]) for x in book["asks"][:10]])
-        total_depth = min(bids_vol, asks_vol)
-        # need at least 3x our order size in book
-        return total_depth > (usdt_needed * 3)
-    except:
-        return True
+        ts = int(time.time()*1000)
+        vol = max(1, math.floor(usdt/10))
+        params = {"api_key":API_KEY,"req_time":ts,"symbol":symbol,"price":0,"vol":vol,"side":side,"type":5,"open_type":1,"leverage":LEVERAGE}
+        params["sign"]=sign(params,API_SECRET)
+        r = requests.post(f"{BASE}/api/v1/private/order/submit", data=params, headers={"ApiKey":API_KEY}, timeout=20)
+        print(f"ORDER {symbol} {side} -> {r.text[:600]}")
+        return r.text
+    except Exception as e:
+        print(f"Order err {e}")
+        return ""
 
-def place_order(symbol, side, vol_usdt, price=None):
-    # side: 1 open long, 2 close long, 3 open short, 4 close short
-    ts = int(time.time()*1000)
-    url = f"{BASE}/api/v1/private/order/submit"
-    # vol = contracts
-    vol = math.floor(vol_usdt / float(price or 1))
-    if vol < 1: vol = 1
-    params = {
-        "api_key": API_KEY,
-        "req_time": ts,
-        "symbol": symbol,
-        "price": price or 0,
-        "vol": vol,
-        "side": side,
-        "type": 1 if price else 5, # 1 limit, 5 market
-        "open_type": 1, # isolated
-        "leverage": LEVERAGE
-    }
-    params["sign"] = sign(params, API_SECRET)
-    r = requests.post(url, data=params, headers={"ApiKey": API_KEY}, timeout=10)
-    print(f"ORDER {symbol} side {side} vol {vol} -> {r.text}")
-    return r.json()
-
-def get_next_funding_time():
+def get_next_funding():
     now = datetime.now(timezone.utc)
-    # MEXC funding 00:00, 08:00, 16:00 UTC (every 8h)
-    hours = [0,8,16]
-    for h in hours:
-        ft = now.replace(hour=h, minute=0, second=0, microsecond=0)
-        if ft > now:
+    for h in [0,8,16]:
+        ft = now.replace(hour=h,minute=0,second=0,microsecond=0)
+        if ft > now+timedelta(seconds=70):
             return ft
-    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (now+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0)
 
-def main(mode="run_once"):
-    print(f"Sniper v6 ADV 70+29% DCA LIVE {LEVERAGE}x bal check...")
-    tg(f"🤖 Sniper LIVE {LEVERAGE}x Mode:{mode} Starting. Balance check...")
+def main(mode="scan"):
+    print(f"=== SNIPER v8 BULLETPROOF mode={mode} ===")
+    print(f"API_KEY present? {len(API_KEY)>10} SECRET {len(API_SECRET)>10}")
+
+    if mode=="scan":
+        rates = get_funding_rates()
+        rates = [r for r in rates if abs(r["rate"])>=0.0001]
+        rates.sort(key=lambda x: abs(x["rate"]), reverse=True)
+        print(f"Found {len(rates)} pairs")
+        for r in rates[:20]:
+            print(f"{r['symbol']} {r['rate']*100:.4f}% price {r['price']}")
+        print("SCAN DONE - if you see list, MEXC NOT blocked")
+        return
 
     balance = get_balance()
-    if balance < 1:
-        print(f"Balance low {balance} - check Futures wallet")
-        return
-    print(f"Balance {balance} USDT")
+    print(f"START balance {balance}")
 
     while True:
-        next_ft = get_next_funding_time()
-        now = datetime.now(timezone.utc)
-        wait = (next_ft - now).total_seconds()
-        print(f"Next funding {next_ft} UTC in {int(wait)}s sleep 60s | bal {balance:.2f}")
-        if wait > 300: # sleep till 5 min before
-            time.sleep(min(60, wait-300))
-            continue
-        if wait > 70:
-            time.sleep(10)
-            continue
+        nxt = get_next_funding()
+        wait = (nxt - datetime.now(timezone.utc)).total_seconds()
+        print(f"Next {nxt} UTC in {int(wait)}s sleep 30")
+        if wait > 300:
+            time.sleep(30); continue
+        if wait > 75:
+            time.sleep(10); continue
 
-        # 50 sec before funding - MAIN ENTRY
-        if 40 <= wait <= 70:
-            print("=== 50sec BEFORE FUNDING - SCANNING ===")
+        if 35 <= wait <= 75:
+            print("50sec BEFORE - SCANNING")
             rates = get_funding_rates()
-            # 2. filter highest
-            filtered = [r for r in rates if abs(r["rate"]) >= MIN_RATE]
-            # 4. pick highest both neg/pos
-            filtered.sort(key=lambda x: abs(x["rate"]), reverse=True)
-            if not filtered:
-                print("No high funding rate")
-                time.sleep(5)
-                continue
-
-            for pick in filtered[:5]: # check top 5 for liquidity
-                symbol = pick["symbol"]
-                rate = pick["rate"]
-                price = pick["price"]
-                side_text = "LONG" if rate < 0 else "SHORT" # neg rate -> long to collect
-                side_code = 1 if rate < 0 else 3
-
-                need_usdt = balance * ENTRY_PCT * LEVERAGE
-                if not check_depth_ok(symbol, need_usdt, price):
-                    print(f"Depth low for {symbol} skip")
-                    continue
-
-                # 5. invest 70%
-                entry_usdt = balance * ENTRY_PCT
-                print(f"ARMED {symbol} rate {rate*100:.3f}% -> {side_text} 70% {entry_usdt:.2f} USDT")
-                tg(f"⚡ ARMED {symbol} {rate*100:.3f}% -> {side_text}\n70% {entry_usdt:.2f} USDT")
-
-                order = place_order(symbol, side_code, need_usdt, price=None) # market
-                entry_price = price
-                avg_price = entry_price
-                total_usdt = entry_usdt
-
-                # Wait for funding
-                print(f"OPEN {side_text} {symbol} waiting funding...")
-                time.sleep(wait + 15) # cross funding
-
-                # 6. After funding volatile -> DCA 29% at 1-1.5% down from avg
-                print("Funding done - checking DCA")
-                # get current price
-                rates2 = get_funding_rates()
-                cur = next((x for x in rates2 if x["symbol"]==symbol), None)
-                cur_price = cur["price"] if cur else price
-
-                price_diff_pct = (cur_price - avg_price)/avg_price*100
-                # If price moved against us 1%+ -> DCA
-                should_dca = False
-                if side_text=="LONG" and price_diff_pct <= -1.0: should_dca=True
-                if side_text=="SHORT" and price_diff_pct >= 1.0: should_dca=True
-
-                if should_dca:
-                    dca_usdt = balance * DCA_PCT
-                    need_dca = dca_usdt * LEVERAGE
-                    print(f"DCA TRIGGER {symbol} {price_diff_pct:.2f}% -> adding 29% {dca_usdt:.2f}")
-                    tg(f"📉 DCA {symbol} {price_diff_pct:.2f}% -> +29%")
-                    place_order(symbol, side_code, need_dca, price=None)
-                    # new avg: (70%*p1 + 29%*p2)/99%
-                    avg_price = (entry_price*70 + cur_price*29)/99
-                    total_usdt = entry_usdt + dca_usdt
-                else:
-                    print(f"No DCA needed {price_diff_pct:.2f}%")
-
-                # 7. Exit at avg price + funding profit
-                # 8. SL -3% price = -15% capital with 5x
-                # Compound loop
-                print(f"HOLDING {symbol} avg {avg_price:.6f} waiting avg exit...")
-                # try exit at avg price
-                for i in range(30): # 30 attempts ~5 min
-                    rates_now = get_funding_rates()
-                    cur = next((x for x in rates_now if x["symbol"]==symbol), None)
-                    if not cur: time.sleep(10); continue
-                    cp = cur["price"]
-                    # Exit if back to avg or profit
-                    pnl_pct = (cp - avg_price)/avg_price*100 if side_text=="LONG" else (avg_price-cp)/avg_price*100
-                    if pnl_pct >= 0.05: # back to avg +0.05%
-                        print(f"EXIT at avg/profit {cp} pnl {pnl_pct:.3f}%")
-                        close_side = 2 if side_text=="LONG" else 4
-                        place_order(symbol, close_side, total_usdt*LEVERAGE, price=None)
-                        funding_profit = abs(rate)*total_usdt*LEVERAGE
-                        print(f"CLOSED {symbol} price {pnl_pct:.3f}% funding +{funding_profit:.4f} USDT")
-                        tg(f"✅ CLOSE {symbol} +{pnl_pct:.3f}% price | funding +{funding_profit:.3f} USDT")
-                        balance = get_balance() # compound
-                        break
-                    # SL -3% price = -15% capital
-                    if pnl_pct <= -3.0:
-                        print(f"SL -3% {symbol} closing {pnl_pct:.2f}%")
-                        close_side = 2 if side_text=="LONG" else 4
-                        place_order(symbol, close_side, total_usdt*LEVERAGE, price=None)
-                        tg(f"🛑 SL {symbol} {pnl_pct:.2f}%")
-                        balance = get_balance()
-                        break
-                    time.sleep(10)
-                else:
-                    # force close
-                    close_side = 2 if side_text=="LONG" else 4
-                    place_order(symbol, close_side, total_usdt*LEVERAGE, price=None)
-
-                if mode=="run_once":
-                    print("run_once done exit")
-                    return
-                else:
-                    break # go wait next funding
-
+            filt = [r for r in rates if abs(r["rate"])>=MIN_RATE]
+            filt.sort(key=lambda x: abs(x["rate"]), reverse=True)
+            print(f"Filtered {len(filt)}")
+            if not filt:
+                time.sleep(5); continue
+            pick = filt[0]
+            symbol=pick["symbol"]; rate=pick["rate"]; price=pick["price"]
+            side_text="LONG" if rate<0 else "SHORT"
+            side_code=1 if rate<0 else 3
+            print(f"ARMED {symbol} {rate*100:.4f}% {side_text}")
+            place_order(symbol, side_code, balance*ENTRY_PCT*LEVERAGE)
+            time.sleep(wait+20)
+            # DCA check
+            rates2 = get_funding_rates()
+            cur = next((x for x in rates2 if x["symbol"]==symbol), None)
+            cur_price = cur["price"] if cur else price
+            diff = (cur_price-price)/price*100
+            print(f"After funding diff {diff:.2f}%")
+            if (side_text=="LONG" and diff<=-1) or (side_text=="SHORT" and diff>=1):
+                print(f"DCA 29% {symbol}")
+                place_order(symbol, side_code, balance*DCA_PCT*LEVERAGE)
+            # Exit at avg
+            for _ in range(30):
+                rn = get_funding_rates()
+                c = next((x for x in rn if x["symbol"]==symbol), None)
+                if not c: 
+                    time.sleep(10); continue
+                pnl = (c["price"]-price)/price*100 if side_text=="LONG" else (price-c["price"])/price*100
+                print(f"HOLD {symbol} pnl {pnl:.3f}%")
+                if pnl>=0.05 or pnl<=-3:
+                    close_side=2 if side_text=="LONG" else 4
+                    place_order(symbol, close_side, balance*0.99*LEVERAGE)
+                    print(f"CLOSED {pnl:.3f}%")
+                    break
+                time.sleep(10)
+            if mode=="run_once":
+                return
         time.sleep(5)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     import sys
-    m = sys.argv[1] if len(sys.argv)>1 else "run_once"
-    main(m)
+    main(sys.argv[1] if len(sys.argv)>1 else "scan")
