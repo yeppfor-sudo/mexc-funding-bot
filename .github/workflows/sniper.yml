@@ -1,0 +1,54 @@
+name: Funding Sniper
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run = trade loop, scan = one-off scan + book check"
+        type: choice
+        options: [run, scan]
+        default: run
+      dry_run:
+        description: "true = paper, false = REAL MONEY"
+        type: choice
+        options: ["true", "false"]
+        default: "false"
+
+concurrency:
+  group: funding-sniper
+  cancel-in-progress: false
+
+jobs:
+  sniper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run LIVE bot
+        env:
+          MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
+          MEXC_API_SECRET: ${{ secrets.MEXC_API_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: ${{ inputs.dry_run || vars.DRY_RUN || 'false' }}
+          SIM_BALANCE: "10"
+          LEVERAGE: "5"
+          ENTRY_PCT: "70"
+          DCA_PCT: "29"
+          MIN_RATE_PCT: "0.5"
+          ENTRY_SECONDS_BEFORE: "50"
+          PRECHECK_SECONDS: "120"
+          DCA_TRIGGER_PCT: "1.0"
+          SL_PRICE_PCT: "3"
+          TAKER_FEE_PCT: "0.02"
+          MAX_SLIPPAGE_PCT: "0.30"
+          FUNDING_CYCLES_HOURS: "4"
+          MAX_HOLD_MINUTES: "0"
+          USE_HARD_SL: "true"
+          RUN_SECONDS: "20700"
+        run: python bot.py ${{ inputs.mode || 'run' }}
