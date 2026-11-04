@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """
 30-day backtest of the funding sniper on REAL MEXC perpetual data (public endpoints, no API key).
-
-Data:   /funding_rate/history (settled rates for every pair) + 1-min klines around each settlement.
-Rules:  same as bot.py -> highest |rate| >= MIN_RATE per slot, 70% at T-60s candle open (5x),
-        funding received at T, DCA 29% if price goes DCA_TRIGGER% against avg, exit at avg (+fee buffer),
-        SL at SL% from current avg, compounding, one trade at a time.
-Honest limits are printed at the end of the summary.
 """
 import csv
 import json
@@ -33,32 +27,42 @@ MIN_RATE = _f("MIN_RATE_PCT", "0.5") / 100
 DCA_TRIG = _f("DCA_TRIGGER_PCT", "1.0")
 SL = _f("SL_PRICE_PCT", "3.0")
 FEE = _f("TAKER_FEE_PCT", "0.02") / 100
-SLIP = _f("SLIPPAGE_PCT", "0.05") / 100        # per fill (no historical order book available)
-SLIP_SL = _f("SL_SLIPPAGE_PCT", "0.15") / 100  # stop fills are worse
-HOLD_H = _f("MAX_HOLD_HOURS", "12")            # backtest cap; forced market close after this
-LIQ_MULT = _f("LIQUIDITY_MULT", "3")           # entry-window turnover must be >= mult x position notional
+SLIP = _f("SLIPPAGE_PCT", "0.05") / 100
+SLIP_SL = _f("SL_SLIPPAGE_PCT", "0.15") / 100
+HOLD_H = _f("MAX_HOLD_HOURS", "12")
+LIQ_MULT = _f("LIQUIDITY_MULT", "3")
 CYCLES = {int(x) for x in os.getenv("FUNDING_CYCLES_HOURS", "4").split(",")}
 OUT = os.getenv("OUT_DIR", "results")
 
 S = requests.Session()
+LAST_ERR = ""
 
 
-def get(path, params=None):
-    for i in range(6):
+def get(path, params=None, tries=5, strict=True):
+    global LAST_ERR
+    for i in range(tries):
         try:
-            j = S.get(BASE + path, params=params, timeout=20).json()
+            r = S.get(BASE + path, params=params, timeout=20)
+            j = r.json()
             if j.get("success"):
+                time.sleep(0.2)
                 return j["data"]
-        except Exception:
-            pass
-        time.sleep(1.2 * (i + 1))
-    raise RuntimeError(f"failed: {path} {params}")
+            LAST_ERR = f"HTTP {r.status_code} {str(j)[:200]}"
+        except Exception as e:
+            LAST_ERR = f"{type(e).__name__}: {str(e)[:200]}"
+        time.sleep(1.5 * (i + 1))
+    if strict:
+        raise RuntimeError(f"failed: {path} {params} | {LAST_ERR}")
+    return None
 
 
 def history(sym, start_ms):
     out, page = [], 1
     while True:
-        d = get("/api/v1/contract/funding_rate/history", {"symbol": sym, "page_num": page, "page_size": 100})
+        d = get("/api/v1/contract/funding_rate/history",
+                {"symbol": sym, "page_num": page, "page_size": 100}, tries=4, strict=False)
+        if d is None:
+            return None
         rows = d.get("resultList") or []
         for r in rows:
             if int(r["settleTime"]) >= start_ms and int(r.get("collectCycle", 8)) in CYCLES:
@@ -98,7 +102,6 @@ def simulate(rate, settle_ms, eq, k):
                 "price_pnl": price_pnl, "fees": fees, "net": net, "ret_pct": net / eq * 100,
                 "hold_min": (t[i] + 60 - (s - 60)) / 60, "end_ms": (t[i] + 60) * 1000}
 
-    # pre-funding candle (entry candle): stop can hit before funding is received
     if adverse(i0) >= SL / 100:
         return finish(st["avg"] * (1 - d * SL / 100), i0, "SL before funding", SLIP_SL)
     last = min(len(t) - 1, i0 + 1 + int(HOLD_H * 60))
@@ -119,9 +122,9 @@ def simulate(rate, settle_ms, eq, k):
             st["q"] += qd
             st["fees"] += nd * FEE
             st["dca"] = True
-            if adverse(i) >= SL / 100:  # pessimistic: same candle also hits the new stop
+            if adverse(i) >= SL / 100:
                 return finish(st["avg"] * (1 - d * SL / 100), i, "STOP-LOSS after DCA", SLIP_SL)
-            continue  # pessimistic: no exit in the DCA candle
+            continue
         if (h[i] >= target) if long else (l[i] <= target):
             return finish(target, i, "exit at avg", SLIP)
     return finish(c[last], last, "timeout market close", SLIP)
@@ -133,11 +136,16 @@ def main():
     syms = [d["symbol"] for d in get("/api/v1/contract/detail")
             if d["symbol"].endswith("_USDT") and d.get("state") == 0]
     print(f"{len(syms)} perpetuals, fetching funding history for {DAYS} days...")
-    with ThreadPoolExecutor(8) as ex:
+    with ThreadPoolExecutor(3) as ex:
         hist = list(ex.map(lambda s: (s, history(s, start_ms)), syms))
+    failed = [s for s, rows in hist if rows is None]
+    print(f"history failed for {len(failed)}/{len(syms)} symbols (skipped). last error: {LAST_ERR}")
+    if len(failed) > len(syms) * 0.5:
+        raise SystemExit("Too many failures - the funding history endpoint is not responding as expected. "
+                         "Send me the 'last error' line above.")
     slots = {}
     for sym, rows in hist:
-        for ms, r in rows:
+        for ms, r in (rows or []):
             if abs(r) >= MIN_RATE:
                 slots.setdefault(ms, []).append((abs(r), sym, r))
     print(f"{len(slots)} funding slots with at least one pair >= {MIN_RATE*100:.2f}%")
@@ -151,7 +159,10 @@ def main():
         res = None
         for _, sym, r in sorted(slots[ms], reverse=True)[:5]:
             k = get(f"/api/v1/contract/kline/{sym}",
-                    {"interval": "Min1", "start": ms // 1000 - 60, "end": ms // 1000 + int(HOLD_H * 3600) + 60})
+                    {"interval": "Min1", "start": ms // 1000 - 60,
+                     "end": ms // 1000 + int(HOLD_H * 3600) + 60}, tries=3, strict=False)
+            if k is None:
+                continue
             res = simulate(r, ms, eq, k)
             if isinstance(res, dict):
                 res.update({"settle_ms": ms, "symbol": sym, "rate_pct": r * 100, "equity_before": eq})
@@ -212,7 +223,8 @@ def main():
     tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if tok and chat:
         try:
-            requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", json={"chat_id": chat, "text": text}, timeout=15)
+            requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                          json={"chat_id": chat, "text": text}, timeout=15)
             for fn in ("equity.png", "trades.csv"):
                 p = f"{OUT}/{fn}"
                 if os.path.exists(p):
