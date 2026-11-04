@@ -46,7 +46,7 @@ jobs:
           DCA_TRIGGER_PCT: "1.0"
           SL_PRICE_PCT: "3"
           TAKER_FEE_PCT: "0.02"
-          MAX_SLIPPAGE_PCT: "0.30"
+          MAX_SLIPPAGE_PCT: "0.50"
           FUNDING_CYCLES_HOURS: "4"
           MAX_HOLD_MINUTES: "0"
           USE_HARD_SL: "true"
