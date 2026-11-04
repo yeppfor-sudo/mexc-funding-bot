@@ -8,21 +8,13 @@ on:
 
 jobs:
   trade:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     timeout-minutes: 370
     steps:
       - uses: actions/checkout@v4
-      - name: WARP + Proxy
-        uses: fscarmen/warp-on-actions@v1.3
-        with:
-          stack: dual
-          mode: client
-          allow-bypass: true
-          check-ip: true
-      - name: Check IP
-        run: |
-          sleep 10
-          curl -s https://api.ipify.org; echo " WARP IP"
+      
+      # NO WARP WHEN USING PROXY - WARP blocks proxy!
+      
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
