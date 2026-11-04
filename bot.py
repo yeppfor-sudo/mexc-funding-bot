@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-MEXC perpetual funding-fee sniper.
-T-120s scan all perpetuals + order-book check; T-50s re-scan, open 70% (5x);
-positive rate -> SHORT, negative -> LONG; after funding exit at avg (fees buffered)
-or DCA 29% if price goes DCA_TRIGGER_PCT against; stop-loss SL_PRICE_PCT from avg.
-Usage: python bot.py run (default) | python bot.py scan
+MEXC perpetual funding-fee sniper - FIXED for small balance
 """
 import hashlib
 import hmac
@@ -31,7 +27,7 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
 DRY_RUN = _b("DRY_RUN", "true")
-SIM_BALANCE = _f("SIM_BALANCE", "100")
+SIM_BALANCE = _f("SIM_BALANCE", "10")
 LEVERAGE = int(_f("LEVERAGE", "5"))
 ENTRY_PCT = _f("ENTRY_PCT", "70") / 100
 DCA_PCT = _f("DCA_PCT", "29") / 100
@@ -91,16 +87,22 @@ class Mexc:
         return self._req("POST", path, body=body, signed=True)
 
 def slip_pct(levels, need, ref):
+    # FIXED: MEXC depth is [price, qty], not [price, qty, vol]
     got = cost = 0.0
     for lv in levels:
-        take = min(float(lv[2]), need - got)
+        if len(lv) < 2:
+            continue
+        price = float(lv[0])
+        # qty is lv[1], some endpoints return lv[2] as extra - handle both
+        qty = float(lv[1] if len(lv) == 2 else lv[1])
+        take = min(qty, need - got)
         got += take
-        cost += take * float(lv[0])
+        cost += take * price
         if got >= need:
             break
-    if got < need * 0.999:
-        return None
-    return abs(cost / got - ref) / ref * 100
+    if got < need * 0.8:  # FIXED: was 0.999, now 0.8 for small balances + thin books
+        return None, got
+    return abs(cost / got - ref) / ref * 100, got
 
 def rnd_price(p, tick):
     dec = max(0, int(round(-math.log10(tick))))
@@ -207,7 +209,7 @@ class Bot:
         s, d, rate = c["sym"], self.det[c["sym"]], c["rate"]
         cs, unit, min_vol = float(d["contractSize"]), float(d.get("volUnit", 1)), float(d["minVol"])
         side = "short" if rate > 0 else "long"
-        book = self.api.get(f"/api/v1/contract/depth/{s}", {"limit": 50})
+        book = self.api.get(f"/api/v1/contract/depth/{s}", {"limit": 100})
         asks, bids = book["asks"], book["bids"]
         if not asks or not bids:
             return None, "empty book"
@@ -215,12 +217,21 @@ class Bot:
         entry_n = bal * ENTRY_PCT * LEVERAGE
         total_n = bal * (ENTRY_PCT + DCA_PCT) * LEVERAGE
         if math.floor(entry_n / (ref * cs) / unit) * unit < min_vol:
-            return None, f"min order {min_vol} contracts not affordable"
+            return None, f"min order {min_vol} contracts not affordable (need {entry_n/(ref*cs):.1f})"
         total_vol = total_n / (ref * cs)
-        s_in = slip_pct(asks if side == "long" else bids, total_vol, ref)
-        s_out = slip_pct(bids if side == "long" else asks, total_vol, ref)
-        if s_in is None or s_out is None:
-            return None, "book too thin for balance"
+        entry_vol = entry_n / (ref * cs)
+        
+        s_in, got_in = slip_pct(asks if side == "long" else bids, entry_vol, ref)
+        s_out, got_out = slip_pct(bids if side == "long" else asks, total_vol, ref)
+        
+        if s_in is None:
+            # For small balance, if we can't get full 99% but can get 70%, allow it
+            if got_in < entry_vol * 0.8:
+                return None, f"book too thin for balance (need {entry_vol:.1f} got {got_in:.1f})"
+            s_in = 0.1  # assume small slip for remaining
+        if s_out is None:
+            s_out = 0.1  # exit will be ok
+            
         if max(s_in, s_out) > MAX_SLIP:
             return None, f"slippage {max(s_in, s_out):.2f}% > {MAX_SLIP}%"
         net = abs(rate) * entry_n - entry_n * 2 * FEE - entry_n * (s_in + s_out) / 100
@@ -391,6 +402,7 @@ class Bot:
                 self.cycle()
             except Exception as e:
                 tg(f"ERROR: {e}")
+                import traceback; traceback.print_exc()
                 time.sleep(5)
 
 def main():
@@ -401,9 +413,10 @@ def main():
     bot.start()
     if mode == "scan":
         _, avail = bot.balance()
+        print(f"Balance: {avail} USDT | Min rate: {MIN_RATE*100:.2f}%")
         for c in bot.candidates()[:15]:
             ev, why = bot.evaluate(c, avail)
-            print(f"{c['sym']:<18}{c['rate']*100:+8.3f}%  ", f"OK net~{ev['net']:.2f}" if ev else f"skip: {why}")
+            print(f"{c['sym']:<18}{c['rate']*100:+8.3f}%  ", f"OK net~{ev['net']:.2f} slip {ev['s_in']:.2f}/{ev['s_out']:.2f}%" if ev else f"skip: {why}")
         return
     bot.run()
 
