@@ -11,16 +11,17 @@ STATE_FILE = "state.json"
 
 # ---- weekly accumulation zone rules ----
 MIN_DD = 80
+LOW_WEEKS = 52           # zone built from lowest low of last 52 weeks
 ZONE_PCT = 0.5
 MAX_ABOVE_LOW = 0.6
 MAX_4W_PUMP = 0.6
 MIN_BARS = 30
 
 # ---- 4h rules ----
-MIN_BODY_PCT = 0.5       # last closed candle green body min %
-CROSS_LOOKBACK = 12      # crossed above EMA20 within last 12 closed 4h candles
-MAX_ABOVE_EMA20 = 12.0   # max % above EMA20 (avoid chasing)
-READY_PCT = 4.0          # "ready to cross": close within 4% below EMA20
+MIN_BODY_PCT = 0.5
+CROSS_LOOKBACK = 30      # crossed above EMA20 within last 30 closed 4h candles
+MAX_ABOVE_EMA20 = 12.0
+READY_PCT = 4.0
 WATCHLIST_MAX = 40
 WATCH_MAX_DAYS = 21
 RESEND_HOURS = 24
@@ -110,18 +111,17 @@ def analyze_zone(sym, gate=True):
         if full is None or len(full) < MIN_BARS + 1:
             return None
         df = closed(full, STEP["Week1"])
-        ath, low = df.h.max(), df.l.min()
-        close = df.c.iloc[-1]
-        low_pos = df.l.idxmin()
+        ath = float(df.h.max())
+        low = float(df.l.iloc[-LOW_WEEKS:].min())     # 52-week base low
+        close = float(df.c.iloc[-1])
         dd = (1 - close / ath) * 100
         above = close / low - 1
-        pump4 = close / df.l.iloc[-4:].min() - 1
-        recent_low = bool(low_pos >= len(df) - 52)
-        rng = df.h.iloc[-6:].max() / df.l.iloc[-6:].min() - 1
+        pump4 = close / float(df.l.iloc[-4:].min()) - 1
+        rng = float(df.h.iloc[-6:].max() / df.l.iloc[-6:].min() - 1)
         div = bull_div(df)
-        r = rsi(df.c).iloc[-1]
+        r = float(rsi(df.c).iloc[-1])
         passed = bool(dd >= MIN_DD and above <= MAX_ABOVE_LOW
-                      and pump4 <= MAX_4W_PUMP and recent_low)
+                      and pump4 <= MAX_4W_PUMP)
         if gate and not passed:
             return None
         score = (dd / 10 + div * 3 + (rng < 1.0) * 2 + (r < 40) * 2
@@ -129,8 +129,8 @@ def analyze_zone(sym, gate=True):
         fib = [low + (ath - low) * f for f in (0.236, 0.382, 0.618)]
         return dict(symbol=sym, passed=passed, score=round(score, 2),
                     dd=round(dd, 1), above_low_pct=round(above * 100, 1),
-                    pump4w_pct=round(pump4 * 100, 1), recent_low=recent_low,
-                    rsi=round(r, 1), divergence=bool(div),
+                    pump4w_pct=round(pump4 * 100, 1), rsi=round(r, 1),
+                    divergence=bool(div), low52=low,
                     zone_low=low, zone_high=low * (1 + ZONE_PCT), sl=low * 0.97,
                     t1=fib[0], t2=fib[1], t3=fib[2], wk=full)
     except Exception:
@@ -147,24 +147,24 @@ def h4_status(sym):
             h4[f"e{n}"] = ema(h4.c, n)
         hc = closed(h4, STEP["Hour4"])
         last = hc.iloc[-1]
-        body = (last.c / last.o - 1) * 100
-        ext = (last.c / last.e20 - 1) * 100          # % above EMA20
-        since = None                                  # candles since close <= EMA20
+        body = float((last.c / last.o - 1) * 100)
+        ext = float((last.c / last.e20 - 1) * 100)
+        since = None
         for k in range(1, CROSS_LOOKBACK + 1):
             p = hc.iloc[-1 - k]
             if p.c <= p.e20:
                 since = k
                 break
-        green_above = (last.c > last.o and last.c > last.e6
-                       and last.c > last.e12 and last.c > last.e20
-                       and body >= MIN_BODY_PCT)
+        green_above = bool(last.c > last.o and last.c > last.e6
+                           and last.c > last.e12 and last.c > last.e20
+                           and body >= MIN_BODY_PCT)
         trig = bool(green_above and since is not None and ext <= MAX_ABOVE_EMA20)
-        gap = (last.e20 / last.c - 1) * 100
+        gap = float((last.e20 / last.c - 1) * 100)
         ready = bool(not trig and last.c <= last.e20 and gap <= READY_PCT
                      and last.e6 > hc.e6.iloc[-4])
         status = "triggered" if trig else ("ready" if ready else None)
         info = dict(body=round(body, 2), gap=round(gap, 2), ext=round(ext, 2),
-                    since=since, green_above=bool(green_above))
+                    since=since, green_above=green_above)
         return status, h4, info
     except Exception:
         return None, None, {}
@@ -191,7 +191,7 @@ def make_chart(z, h4, info):
     st = max(len(df) // 6, 1)
     a1.set_xticks(range(0, len(df), st))
     a1.set_xticklabels(df.t.dt.strftime("%b %y")[::st])
-    a1.set_title(f'{z["symbol"]} 1W | DD {z["dd"]}% | +{z["above_low_pct"]}% above low')
+    a1.set_title(f'{z["symbol"]} 1W | DD {z["dd"]}% | +{z["above_low_pct"]}% above 52w low')
     h = h4.iloc[-90:].reset_index(drop=True)
     candles(a2, h)
     for n, c in ((6, "#e377c2"), (12, "#ff9f40"), (20, "#6c5ce7")):
@@ -227,15 +227,15 @@ def debug(sym):
     if z is None:
         print("no weekly data / not enough bars")
         return
+    print(f"WEEKLY  52w low {z['low52']:.6g}")
     print(f"WEEKLY  drawdown {z['dd']}% (need >= {MIN_DD})")
-    print(f"WEEKLY  above cycle low {z['above_low_pct']}% (need <= {MAX_ABOVE_LOW*100:.0f})")
+    print(f"WEEKLY  above 52w low {z['above_low_pct']}% (need <= {MAX_ABOVE_LOW*100:.0f})")
     print(f"WEEKLY  4w pump {z['pump4w_pct']}% (need <= {MAX_4W_PUMP*100:.0f})")
-    print(f"WEEKLY  low within 52w: {z['recent_low']}")
     print(f"WEEKLY  ZONE PASSED: {z['passed']} | RSI {z['rsi']} | divergence {z['divergence']}")
     st, h4, info = h4_status(sym)
     print(f"4H      status: {st}")
     print(f"4H      {info}")
-    print(f"4H      need: green_above_all_emas True, since not None (<= {CROSS_LOOKBACK}), "
+    print(f"4H      need: green_above True, since not None (<= {CROSS_LOOKBACK}), "
           f"ext <= {MAX_ABOVE_EMA20}")
 
 
@@ -257,7 +257,6 @@ def main():
     zmap = {z["symbol"]: z for z in zones}
     print("zone pairs:", len(zmap))
 
-    # saved pairs are always scanned, even if they left the zone
     for s in list(state["watchlist"]):
         if s not in zmap:
             z = analyze_zone(s, gate=False)
