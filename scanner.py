@@ -243,7 +243,31 @@ def candles(ax, df):
         ax.bar(i, abs(row.c - row.o), bottom=min(row.o, row.c), color=col, width=0.7)
 
 def make_chart(z, h4, info, total, tgt):
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(16, 6))
+    fig, (a2, a1) = plt.subplots(2, 1, figsize=(12, 13),
+                                 gridspec_kw={"height_ratios": [3, 2]})
+    # ---------- 4h (top, big) ----------
+    h = h4.iloc[-90:].reset_index(drop=True)
+    candles(a2, h)
+    for n, c in ((6, "#e377c2"), (12, "#ff9f40"), (20, "#6c5ce7")):
+        a2.plot(h[f"e{n}"], color=c, lw=1.6, label=f"EMA{n}")
+    price = float(h.c.iloc[-1])
+    sl4 = float(info["swing_sl"])
+    a2.axhline(price, color="green", ls=":", lw=1.2, label=f"Live {price:.6g}")
+    a2.axhline(sl4, color="red", ls="--", lw=1.2, label=f"4h SL {sl4:.6g}")
+    lo = min(float(h.l.min()), sl4) * 0.98
+    hi = float(max(h.h.max(), h.e20.max())) * 1.04
+    if tgt <= hi * 1.5:                       # draw target only if it fits
+        a2.axhline(tgt, color="blue", ls="--", lw=1.2, label=f"Target {tgt:.6g}")
+        hi = max(hi, tgt * 1.02)
+    a2.set_ylim(lo, hi)
+    a2.legend(fontsize=9, loc="upper left")
+    st = max(len(h) // 8, 1)
+    a2.set_xticks(range(0, len(h), st))
+    a2.set_xticklabels(h.t.dt.strftime("%d %b %H:%M")[::st], fontsize=8)
+    a2.set_title(f'{z["symbol"]} 4h | Grade {grade(total)} ({total:.0f}/100) | '
+                 f'crossed {info["since"]} candles ago | vol x{info["vr"]} | '
+                 f'next target {tgt:.6g}', fontsize=12)
+    # ---------- weekly (bottom) ----------
     df = z["wk"].iloc[-130:].reset_index(drop=True)
     a1.set_facecolor("#fff8c4")
     candles(a1, df)
@@ -252,28 +276,14 @@ def make_chart(z, h4, info, total, tgt):
     for k, c in (("t1", "blue"), ("t2", "purple"), ("t3", "navy")):
         a1.axhline(z[k], color=c, lw=0.8, label=f"{k.upper()} {z[k]:.6g}")
     a1.set_yscale("log")
-    a1.legend(fontsize=7, loc="upper right")
+    a1.legend(fontsize=8, loc="upper right")
     st = max(len(df) // 6, 1)
     a1.set_xticks(range(0, len(df), st))
     a1.set_xticklabels(df.t.dt.strftime("%b %y")[::st])
-    a1.set_title(f'{z["symbol"]} 1W | DD {z["dd"]}% | +{z["above_low_pct"]}% above 52w low')
-    h = h4.iloc[-90:].reset_index(drop=True)
-    candles(a2, h)
-    for n, c in ((6, "#e377c2"), (12, "#ff9f40"), (20, "#6c5ce7")):
-        a2.plot(h[f"e{n}"], color=c, lw=1.4, label=f"EMA{n}")
-    price = float(h.c.iloc[-1])
-    a2.axhline(price, color="green", ls=":", lw=1, label=f"Live {price:.6g}")
-    a2.axhline(info["swing_sl"], color="red", ls="--", lw=1, label=f"4h SL {info['swing_sl']:.6g}")
-    a2.axhline(tgt, color="blue", ls="--", lw=1, label=f"Target {tgt:.6g}")
-    a2.legend(fontsize=7, loc="upper left")
-    st = max(len(h) // 6, 1)
-    a2.set_xticks(range(0, len(h), st))
-    a2.set_xticklabels(h.t.dt.strftime("%d %b %H:%M")[::st], fontsize=7)
-    a2.set_title(f'4h | Grade {grade(total)} ({total:.0f}/100) | crossed {info["since"]} candles ago | '
-                 f'vol x{info["vr"]}')
+    a1.set_title(f'1W | DD {z["dd"]}% | +{z["above_low_pct"]}% above 52w low', fontsize=11)
     plt.tight_layout()
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=110)
+    plt.savefig(buf, format="png", dpi=100)
     plt.close(fig)
     buf.seek(0)
     return buf
