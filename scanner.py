@@ -11,7 +11,7 @@ STATE_FILE = "state.json"
 
 # ---- weekly accumulation zone rules ----
 MIN_DD = 80
-LOW_WEEKS = 52           # zone built from lowest low of last 52 weeks
+LOW_WEEKS = 52
 ZONE_PCT = 0.5
 MAX_ABOVE_LOW = 0.6
 MAX_4W_PUMP = 0.6
@@ -19,9 +19,17 @@ MIN_BARS = 30
 
 # ---- 4h rules ----
 MIN_BODY_PCT = 0.5
-CROSS_LOOKBACK = 30      # crossed above EMA20 within last 30 closed 4h candles
+CROSS_LOOKBACK = 30
 MAX_ABOVE_EMA20 = 12.0
+MAX_3D_PUMP = 45.0        # skip if already +45% in last 3 days
 READY_PCT = 4.0
+
+# ---- smart filters ----
+MIN_TURNOVER = 50_000     # min 24h USDT turnover
+ALERT_MIN_SCORE = 50      # 0-100
+MIN_RR = 1.0              # min reward/risk (swing SL -> next target)
+BTC_CRASH_BLOCK = 4.0     # pause alerts if BTC fell >4% in last 2 candles
+
 WATCHLIST_MAX = 40
 WATCH_MAX_DAYS = 21
 RESEND_HOURS = 24
@@ -59,14 +67,24 @@ def save_state(s):
 
 def get_symbols():
     j = get(BASE + "/detail")
-    out = []
+    syms = []
     for x in j["data"]:
         if x.get("quoteCoin") != "USDT" or x.get("state") != 0:
             continue
         if x.get("baseCoin", "").upper() in SKIP:
             continue
-        out.append(x["symbol"])
-    return out
+        syms.append(x["symbol"])
+    turn = {}
+    t = get(BASE + "/ticker")
+    if t and t.get("data"):
+        for x in t["data"]:
+            try:
+                turn[x["symbol"]] = float(x.get("amount24") or 0)
+            except Exception:
+                pass
+    if turn:
+        syms = [s for s in syms if turn.get(s, 0) >= MIN_TURNOVER]
+    return syms, turn
 
 def klines(sym, interval, n=500):
     end = int(time.time())
@@ -75,8 +93,9 @@ def klines(sym, interval, n=500):
     d = j.get("data") if j else None
     if not d or not d.get("time"):
         return None
+    vol = d.get("vol") or [0] * len(d["time"])
     df = pd.DataFrame({"ts": d["time"], "o": d["open"], "h": d["high"],
-                       "l": d["low"], "c": d["close"]})
+                       "l": d["low"], "c": d["close"], "v": vol})
     df["t"] = pd.to_datetime(df.ts, unit="s")
     return df
 
@@ -103,6 +122,28 @@ def bull_div(df, look=50):
     a, b = piv[-2], piv[-1]
     return d.l[b] < d.l[a] and r[b] > r[a] and (len(d) - b) <= 12
 
+def grade(score):
+    return "A" if score >= 70 else ("B" if score >= 55 else "C")
+
+
+# ---------------- scoring ----------------
+def weekly_score(dd, above, rng, r, div):
+    s = min(dd, 99) / 99 * 15
+    s += max(0, 1 - above / MAX_ABOVE_LOW) * 10
+    s += max(0, 1 - rng / 1.5) * 7
+    s += 5 if r < 40 else (2 if r < 50 else 0)
+    s += 3 if div else 0
+    return s                                   # max 40
+
+def trigger_score(since, vr, body, stack, slope, ext):
+    s = 20 if since <= 3 else 14 if since <= 8 else 8 if since <= 15 else 3
+    s += 15 if vr >= 2 else 10 if vr >= 1.5 else 5 if vr >= 1.2 else 0
+    s += min(body, 6) / 6 * 8
+    s += 7 if stack else 0
+    s += 5 if slope else 0
+    s += 5 if ext <= 4 else 2 if ext <= 8 else 0
+    return s                                   # max 60
+
 
 # ---------------- weekly accumulation zone ----------------
 def analyze_zone(sym, gate=True):
@@ -112,25 +153,23 @@ def analyze_zone(sym, gate=True):
             return None
         df = closed(full, STEP["Week1"])
         ath = float(df.h.max())
-        low = float(df.l.iloc[-LOW_WEEKS:].min())     # 52-week base low
+        low = float(df.l.iloc[-LOW_WEEKS:].min())
         close = float(df.c.iloc[-1])
         dd = (1 - close / ath) * 100
         above = close / low - 1
         pump4 = close / float(df.l.iloc[-4:].min()) - 1
         rng = float(df.h.iloc[-6:].max() / df.l.iloc[-6:].min() - 1)
-        div = bull_div(df)
+        div = bool(bull_div(df))
         r = float(rsi(df.c).iloc[-1])
-        passed = bool(dd >= MIN_DD and above <= MAX_ABOVE_LOW
-                      and pump4 <= MAX_4W_PUMP)
+        passed = bool(dd >= MIN_DD and above <= MAX_ABOVE_LOW and pump4 <= MAX_4W_PUMP)
         if gate and not passed:
             return None
-        score = (dd / 10 + div * 3 + (rng < 1.0) * 2 + (r < 40) * 2
-                 + max(0, 1 - above / MAX_ABOVE_LOW) * 2)
+        ws = weekly_score(dd, above, rng, r, div)
         fib = [low + (ath - low) * f for f in (0.236, 0.382, 0.618)]
-        return dict(symbol=sym, passed=passed, score=round(score, 2),
+        return dict(symbol=sym, passed=passed, wscore=round(ws, 1),
                     dd=round(dd, 1), above_low_pct=round(above * 100, 1),
                     pump4w_pct=round(pump4 * 100, 1), rsi=round(r, 1),
-                    divergence=bool(div), low52=low,
+                    divergence=div, low52=low,
                     zone_low=low, zone_high=low * (1 + ZONE_PCT), sl=low * 0.97,
                     t1=fib[0], t2=fib[1], t3=fib[2], wk=full)
     except Exception:
@@ -155,19 +194,45 @@ def h4_status(sym):
             if p.c <= p.e20:
                 since = k
                 break
+        vol_avg = float(hc.v.iloc[-21:-1].mean())
+        vr = float(last.v / vol_avg) if vol_avg > 0 else 0.0
+        stack = bool(last.e6 > last.e12 > last.e20)
+        slope = bool(last.e20 > hc.e20.iloc[-4])
+        swing_sl = float(hc.l.iloc[-12:].min()) * 0.995
+        pump3d = float((last.c / hc.l.iloc[-18:].min() - 1) * 100)
         green_above = bool(last.c > last.o and last.c > last.e6
                            and last.c > last.e12 and last.c > last.e20
                            and body >= MIN_BODY_PCT)
-        trig = bool(green_above and since is not None and ext <= MAX_ABOVE_EMA20)
+        trig = bool(green_above and since is not None
+                    and ext <= MAX_ABOVE_EMA20 and pump3d <= MAX_3D_PUMP)
         gap = float((last.e20 / last.c - 1) * 100)
         ready = bool(not trig and last.c <= last.e20 and gap <= READY_PCT
                      and last.e6 > hc.e6.iloc[-4])
         status = "triggered" if trig else ("ready" if ready else None)
+        s4 = trigger_score(since, vr, body, stack, slope, ext) if trig else 0.0
         info = dict(body=round(body, 2), gap=round(gap, 2), ext=round(ext, 2),
-                    since=since, green_above=green_above)
+                    since=since, vr=round(vr, 2), stack=stack, slope=slope,
+                    swing_sl=swing_sl, pump3d=round(pump3d, 1),
+                    green_above=green_above, s4=round(s4, 1))
         return status, h4, info
     except Exception:
         return None, None, {}
+
+def plan(z, price, swing_sl):
+    tgt = next((t for t in (z["t1"], z["t2"], z["t3"]) if t > price * 1.03), z["t3"])
+    risk = price - swing_sl
+    rr = (tgt - price) / risk if risk > 0 and tgt > price else 0.0
+    return tgt, round(rr, 2)
+
+def btc_regime():
+    try:
+        b = klines("BTC_USDT", "Hour4", 100)
+        b["e20"] = ema(b.c, 20)
+        bc = closed(b, STEP["Hour4"])
+        chg2 = float((bc.c.iloc[-1] / bc.c.iloc[-3] - 1) * 100)
+        return dict(above=bool(bc.c.iloc[-1] > bc.e20.iloc[-1]), chg2=round(chg2, 2))
+    except Exception:
+        return dict(above=True, chg2=0.0)
 
 
 # ---------------- chart + telegram ----------------
@@ -177,7 +242,7 @@ def candles(ax, df):
         ax.plot([i, i], [row.l, row.h], color=col, lw=1)
         ax.bar(i, abs(row.c - row.o), bottom=min(row.o, row.c), color=col, width=0.7)
 
-def make_chart(z, h4, info):
+def make_chart(z, h4, info, total, tgt):
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(16, 6))
     df = z["wk"].iloc[-130:].reset_index(drop=True)
     a1.set_facecolor("#fff8c4")
@@ -196,12 +261,16 @@ def make_chart(z, h4, info):
     candles(a2, h)
     for n, c in ((6, "#e377c2"), (12, "#ff9f40"), (20, "#6c5ce7")):
         a2.plot(h[f"e{n}"], color=c, lw=1.4, label=f"EMA{n}")
+    price = float(h.c.iloc[-1])
+    a2.axhline(price, color="green", ls=":", lw=1, label=f"Live {price:.6g}")
+    a2.axhline(info["swing_sl"], color="red", ls="--", lw=1, label=f"4h SL {info['swing_sl']:.6g}")
+    a2.axhline(tgt, color="blue", ls="--", lw=1, label=f"Target {tgt:.6g}")
     a2.legend(fontsize=7, loc="upper left")
     st = max(len(h) // 6, 1)
     a2.set_xticks(range(0, len(h), st))
     a2.set_xticklabels(h.t.dt.strftime("%d %b %H:%M")[::st], fontsize=7)
-    a2.set_title(f'4h | crossed {info.get("since")} candles ago | '
-                 f'{info.get("ext")}% above EMA20 | LIVE {h.c.iloc[-1]:.6g}')
+    a2.set_title(f'4h | Grade {grade(total)} ({total:.0f}/100) | crossed {info["since"]} candles ago | '
+                 f'vol x{info["vr"]}')
     plt.tight_layout()
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=110)
@@ -212,11 +281,28 @@ def make_chart(z, h4, info):
 def tg_photo(buf, caption):
     tok = os.environ["TELEGRAM_BOT_TOKEN"]
     chat = os.environ["TELEGRAM_CHAT_ID"]
-    r = requests.post(f"https://api.telegram.org/bot{tok}/sendPhoto",
-                      data={"chat_id": chat, "caption": caption[:1000]},
-                      files={"photo": ("chart.png", buf.getvalue())}, timeout=60)
-    print("telegram", r.status_code)
-    return r.status_code == 200
+    for _ in range(2):
+        try:
+            buf.seek(0)
+            r = requests.post(f"https://api.telegram.org/bot{tok}/sendPhoto",
+                              data={"chat_id": chat, "caption": caption[:1000]},
+                              files={"photo": ("chart.png", buf.getvalue())}, timeout=60)
+            print("telegram", r.status_code)
+            if r.status_code == 200:
+                return True
+        except Exception as e:
+            print("telegram error", e)
+        time.sleep(3)
+    return False
+
+def tg_text(text):
+    tok = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat = os.environ["TELEGRAM_CHAT_ID"]
+    try:
+        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                      data={"chat_id": chat, "text": text[:4000]}, timeout=30)
+    except Exception as e:
+        print("telegram text error", e)
 
 
 # ---------------- test mode ----------------
@@ -227,16 +313,18 @@ def debug(sym):
     if z is None:
         print("no weekly data / not enough bars")
         return
-    print(f"WEEKLY  52w low {z['low52']:.6g}")
-    print(f"WEEKLY  drawdown {z['dd']}% (need >= {MIN_DD})")
-    print(f"WEEKLY  above 52w low {z['above_low_pct']}% (need <= {MAX_ABOVE_LOW*100:.0f})")
-    print(f"WEEKLY  4w pump {z['pump4w_pct']}% (need <= {MAX_4W_PUMP*100:.0f})")
-    print(f"WEEKLY  ZONE PASSED: {z['passed']} | RSI {z['rsi']} | divergence {z['divergence']}")
+    print(f"WEEKLY  52w low {z['low52']:.6g} | drawdown {z['dd']}% (need >= {MIN_DD})")
+    print(f"WEEKLY  above low {z['above_low_pct']}% (need <= {MAX_ABOVE_LOW*100:.0f}) | 4w pump {z['pump4w_pct']}%")
+    print(f"WEEKLY  ZONE PASSED: {z['passed']} | RSI {z['rsi']} | div {z['divergence']} | wscore {z['wscore']}/40")
     st, h4, info = h4_status(sym)
     print(f"4H      status: {st}")
     print(f"4H      {info}")
-    print(f"4H      need: green_above True, since not None (<= {CROSS_LOOKBACK}), "
-          f"ext <= {MAX_ABOVE_EMA20}")
+    if st == "triggered":
+        total = z["wscore"] + info["s4"]
+        price = float(h4.c.iloc[-1])
+        tgt, rr = plan(z, price, info["swing_sl"])
+        print(f"TOTAL   {total:.1f}/100 grade {grade(total)} | need >= {ALERT_MIN_SCORE}")
+        print(f"PLAN    price {price:.6g} | 4h SL {info['swing_sl']:.6g} | target {tgt:.6g} | RR {rr} (need >= {MIN_RR})")
 
 
 # ---------------- main ----------------
@@ -248,10 +336,11 @@ def main():
 
     state = load_state()
     now = time.time()
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
 
-    syms = get_symbols()
-    print("pairs:", len(syms))
+    syms, turn = get_symbols()
+    print("pairs (liquid crypto):", len(syms))
     with ThreadPoolExecutor(6) as ex:
         zones = [z for z in ex.map(analyze_zone, syms) if z]
     zmap = {z["symbol"]: z for z in zones}
@@ -271,23 +360,44 @@ def main():
         for sym, st, h4, info in ex.map(chk, list(zmap)):
             results[sym] = (st, h4, info)
 
-    # 1) alerts
+    btc = btc_regime()
+    btc_blocked = btc["chg2"] <= -BTC_CRASH_BLOCK
+    print("BTC regime:", btc, "| blocked:", btc_blocked)
+
+    # 1) alerts (best score first)
+    cands = []
     for sym, (st, h4, info) in results.items():
         if st != "triggered":
             continue
+        z = zmap[sym]
+        total = z["wscore"] + info["s4"]
+        price = float(h4.c.iloc[-1])
+        tgt, rr = plan(z, price, info["swing_sl"])
+        cands.append((total, sym, z, h4, info, price, tgt, rr))
+    cands.sort(key=lambda x: x[0], reverse=True)
+
+    for total, sym, z, h4, info, price, tgt, rr in cands:
+        if btc_blocked:
+            print("BTC crash block, skip", sym)
+            continue
+        if total < ALERT_MIN_SCORE or rr < MIN_RR:
+            print("filtered", sym, round(total, 1), "rr", rr)
+            continue
         if now - state["sent"].get(sym, 0) < RESEND_HOURS * 3600:
             continue
-        z = zmap[sym]
-        price = h4.c.iloc[-1]
-        cap = (f"🚀 {sym} 4h closed green above EMA20\n"
-               f"Live price: {price:.6g} ({info['ext']}% above EMA20, "
-               f"crossed {info['since']} candles ago)\n"
-               f"Zone: {z['zone_low']:.6g} - {z['zone_high']:.6g}\n"
-               f"SL (1W close below): {z['sl']:.6g}\n"
+        btc_txt = "BTC 4h above EMA20 ✅" if btc["above"] else "BTC 4h below EMA20 ⚠️"
+        cap = (f"🚀 {sym} | Grade {grade(total)} ({total:.0f}/100)\n"
+               f"4h closed green above EMA20 (crossed {info['since']} candles ago, "
+               f"vol x{info['vr']}, {info['ext']}% above EMA20)\n"
+               f"Live: {price:.6g}\n"
+               f"4h SL: {info['swing_sl']:.6g} | Weekly SL: {z['sl']:.6g}\n"
+               f"Next target: {tgt:.6g} | R:R {rr}\n"
                f"T1 {z['t1']:.6g} | T2 {z['t2']:.6g} | T3 {z['t3']:.6g}\n"
-               f"DD from ATH: {z['dd']}% | RSI(1W): {z['rsi']} | Div: {z['divergence']}")
+               f"DD from ATH {z['dd']}% | +{z['above_low_pct']}% above 52w low | "
+               f"RSI(1W) {z['rsi']} | Div {z['divergence']}\n"
+               f"{btc_txt}")
         try:
-            if tg_photo(make_chart(z, h4, info), cap):
+            if tg_photo(make_chart(z, h4, info, total, tgt), cap):
                 state["sent"][sym] = now
                 state["watchlist"].pop(sym, None)
         except Exception as e:
@@ -301,19 +411,21 @@ def main():
         if z is None or not z["passed"] or age_days > WATCH_MAX_DAYS:
             state["watchlist"].pop(sym)
             continue
-        if results.get(sym, (None,))[0] == "ready":
-            w["score"] = round(z["score"] + 3, 2)
+        st, h4, info = results.get(sym, (None, None, {}))
+        if st == "ready":
+            w["score"] = round(z["wscore"] + max(0, (READY_PCT - info["gap"]) / READY_PCT) * 20, 1)
+            w["gap_pct"] = info["gap"]
 
     # 3) add new "ready to cross" pairs (each pair saved once)
     new = []
     for sym, (st, h4, info) in results.items():
         z = zmap[sym]
         if st == "ready" and z["passed"] and sym not in state["watchlist"]:
-            sc = z["score"] + max(0, (READY_PCT - info["gap"]) / READY_PCT) * 3
+            sc = z["wscore"] + max(0, (READY_PCT - info["gap"]) / READY_PCT) * 20
             new.append((sc, sym, z, info))
     new.sort(reverse=True)
     for sc, sym, z, info in new:
-        state["watchlist"][sym] = dict(added=now_iso, score=round(sc, 2),
+        state["watchlist"][sym] = dict(added=now_iso, score=round(sc, 1),
                                        gap_pct=info["gap"], zone_low=z["zone_low"],
                                        zone_high=z["zone_high"], sl=z["sl"])
 
@@ -321,6 +433,16 @@ def main():
         keep = sorted(state["watchlist"].items(), key=lambda kv: kv[1]["score"],
                       reverse=True)[:WATCHLIST_MAX]
         state["watchlist"] = dict(keep)
+
+    # 4) daily watchlist summary (once per UTC day)
+    today = now_dt.strftime("%Y-%m-%d")
+    if state.get("last_summary") != today and state["watchlist"]:
+        rows = sorted(state["watchlist"].items(), key=lambda kv: kv[1]["score"], reverse=True)
+        lines = [f"📋 Watchlist ({len(rows)}) - ready to cross 4h EMA20"]
+        for i, (s, w) in enumerate(rows, 1):
+            lines.append(f"{i}. {s}  score {w['score']}  gap {w.get('gap_pct', '?')}%")
+        tg_text("\n".join(lines))
+        state["last_summary"] = today
 
     state["sent"] = {k: v for k, v in state["sent"].items() if now - v < 48 * 3600}
     state["updated"] = now_iso
