@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 BASE = "https://contract.mexc.com/api/v1/contract"
 STATE_FILE = "state.json"
+WATERMARK = "RANJHA"
 
 # ---- weekly accumulation zone rules ----
 MIN_DD = 80
@@ -281,6 +282,11 @@ def make_chart(z, h4, info, total, tgt):
     a1.set_xticks(range(0, len(df), st))
     a1.set_xticklabels(df.t.dt.strftime("%b %y")[::st])
     a1.set_title(f'1W | DD {z["dd"]}% | +{z["above_low_pct"]}% above 52w low', fontsize=11)
+
+    # ---------- watermark ----------
+    fig.text(0.5, 0.5, WATERMARK, fontsize=90, color="gray", alpha=0.15,
+             ha="center", va="center", rotation=30, fontweight="bold", zorder=0)
+
     plt.tight_layout()
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=100)
