@@ -31,7 +31,7 @@ READY_PCT = 4.0
 
 # ---- smart filters ----
 MIN_TURNOVER = 50_000     # min 24h USDT turnover
-ALERT_MIN_SCORE = 50      # 0-100
+ALERT_MIN_SCORE = 50      # alerts only for score 50+
 MIN_RR = 1.0              # min reward/risk (swing SL -> next target)
 BTC_CRASH_BLOCK = 4.0     # pause alerts if BTC fell >4% in last 2 candles
 
@@ -72,6 +72,8 @@ def save_state(s):
 
 def get_symbols():
     j = get(BASE + "/detail")
+    if not j or not j.get("data"):
+        return [], {}
     syms = []
     for x in j["data"]:
         if x.get("quoteCoin") != "USDT" or x.get("state") != 0:
@@ -206,6 +208,8 @@ def tf_status(sym, tf):
         for n in (6, 12, 20):
             h4[f"e{n}"] = ema(h4.c, n)
         hc = closed(h4, STEP[tf])
+        if len(hc) < 40:
+            return None, None, {}
         last = hc.iloc[-1]
         body = float((last.c / last.o - 1) * 100)
         ext = float((last.c / last.e20 - 1) * 100)
@@ -403,6 +407,9 @@ def main():
 
     syms, turn = get_symbols()
     print("pairs (liquid crypto):", len(syms))
+    if not syms:
+        print("no pairs returned by MEXC, exiting")
+        return
     with ThreadPoolExecutor(6) as ex:
         zones = [z for z in ex.map(analyze_zone, syms) if z]
     zmap = {z["symbol"]: z for z in zones}
@@ -471,7 +478,11 @@ def main():
     for sym in list(state["watchlist"]):
         w = state["watchlist"][sym]
         z = zmap.get(sym)
-        age_days = (now - datetime.fromisoformat(w["added"]).timestamp()) / 86400
+        try:
+            age_days = (now - datetime.fromisoformat(w["added"]).timestamp()) / 86400
+        except Exception:
+            age_days = 0
+            w["added"] = now_iso
         if z is None or not z["passed"] or age_days > WATCH_MAX_DAYS:
             state["watchlist"].pop(sym)
             continue
@@ -496,17 +507,17 @@ def main():
                                        zone_high=z["zone_high"], sl=z["sl"])
 
     if len(state["watchlist"]) > WATCHLIST_MAX:
-        keep = sorted(state["watchlist"].items(), key=lambda kv: kv[1]["score"],
+        keep = sorted(state["watchlist"].items(), key=lambda kv: kv[1].get("score", 0),
                       reverse=True)[:WATCHLIST_MAX]
         state["watchlist"] = dict(keep)
 
     # 4) daily watchlist summary (once per UTC day)
     today = now_dt.strftime("%Y-%m-%d")
     if state.get("last_summary") != today and state["watchlist"]:
-        rows = sorted(state["watchlist"].items(), key=lambda kv: kv[1]["score"], reverse=True)
+        rows = sorted(state["watchlist"].items(), key=lambda kv: kv[1].get("score", 0), reverse=True)
         lines = [f"📋 Watchlist ({len(rows)}) - ready to cross EMA20 (4h/8h/12h)"]
         for i, (s, w) in enumerate(rows, 1):
-            lines.append(f"{i}. {s}  [{w.get('tf', '4h')}]  score {w['score']}  gap {w.get('gap_pct', '?')}%")
+            lines.append(f"{i}. {s}  [{w.get('tf', '4h')}]  score {w.get('score', '?')}  gap {w.get('gap_pct', '?')}%")
         tg_text("\n".join(lines))
         state["last_summary"] = today
 
