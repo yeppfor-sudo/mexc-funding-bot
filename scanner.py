@@ -31,7 +31,7 @@ READY_PCT = 4.0
 
 # ---- smart filters ----
 MIN_TURNOVER = 50_000     # min 24h USDT turnover
-ALERT_MIN_SCORE = 50      # alerts only for score 50+
+ALERT_MIN_SCORE = 70      # Grade A only
 MIN_RR = 1.0              # min reward/risk (swing SL -> next target)
 BTC_CRASH_BLOCK = 4.0     # pause alerts if BTC fell >4% in last 2 candles
 
@@ -449,8 +449,8 @@ def main():
         if btc_blocked:
             print("BTC crash block, skip", sym)
             continue
-        if total < ALERT_MIN_SCORE or rr < MIN_RR:
-            print("filtered", sym, tf, round(total, 1), "rr", rr)
+        if grade(total) != "A" or total < ALERT_MIN_SCORE or rr < MIN_RR:
+            print("filtered (not grade A / low RR)", sym, tf, round(total, 1), "rr", rr)
             continue
         if now - state["sent"].get(sym, 0) < RESEND_HOURS * 3600:
             continue
