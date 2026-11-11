@@ -11,7 +11,7 @@ BASE = "https://contract.mexc.com/api/v1/contract"
 STATE_FILE = "state_stocks.json"
 WATERMARK = "RANJHA"
 
-# ---- stock universe (MEXC base coins). Add more here or via EXTRA_STOCKS env ----
+# ---- stock universe (Yahoo/US tickers). Add more here or via EXTRA_STOCKS env ----
 STOCKS = {
     "TSLA","NVDA","AAPL","MSFT","AMZN","GOOGL","GOOG","META","COIN","MSTR","HOOD",
     "CRCL","NFLX","AMD","PLTR","INTC","BABA","ORCL","AVGO","MU","CRWV","UBER",
@@ -21,28 +21,34 @@ STOCKS = {
     "GME","AMC","RIVN","LCID","NIO","XPEV","LI","MARA","RIOT","CLSK","IBIT",
     "BMNR","SBET","FIG","APP","IONQ","OKLO","SMR","RGTI","QBTS","DELL",
     "TXN","CSCO","IBM","T","VZ","BAC","WFC","GS","MS","C","LLY","UNH","JNJ",
-    "MRK","ABBV","HD","LOW","TGT","NOW","PANW","CRWD","ZS","SPOT",
+    "MRK","ABBV","HD","LOW","TGT","NOW","PANW","CRWD","ZS","SPOT","SPY","QQQ",
 }
 _extra = os.environ.get("EXTRA_STOCKS", "")
 STOCKS |= {x.strip().upper() for x in _extra.split(",") if x.strip()}
 
-# MEXC base coin -> Yahoo ticker (only where they differ)
+# tickers that are ALSO real crypto coins: only matched when the MEXC name has a
+# stock suffix (e.g. CVXSTOCK) or the contract is flagged as a stock
+AMBIG = {"T","C","F","CVX","V","MA","LI","GM","NET","NOW","APP","SMR","ARM","LOW",
+         "GME","AMC","FIG","ZS","BA","MS","MU","HD","TGT","SNAP","PINS","ROKU"}
+SUFFIXES = ("STOCK", "STOCKS", "ON", "X")
+
+# Yahoo ticker fixes (only where they differ)
 YAHOO_MAP = {"BRKB": "BRK-B", "BRK.B": "BRK-B", "BFB": "BF-B"}
 
 # ---- weekly accumulation zone rules (tuned for stocks) ----
-MIN_DD = 40               # min drawdown from ATH (%)
+MIN_DD = 40
 LOW_WEEKS = 52
-ZONE_PCT = 0.25           # accumulation zone = 52w low -> +25%
-MAX_ABOVE_LOW = 0.35      # max % above 52w low (0.35 = 35%)
+ZONE_PCT = 0.25
+MAX_ABOVE_LOW = 0.35
 MAX_4W_PUMP = 0.30
 MIN_BARS = 20
-MAX_PRICE_DIFF = 0.25     # Yahoo vs MEXC price must be within 25% (collision guard)
+MAX_PRICE_DIFF = 0.25     # Yahoo vs MEXC price must be within 25%
 
 # ---- trigger timeframes (4h, 8h, 12h) on MEXC perp candles ----
 TFS = {"4h": "Hour4", "8h": "Hour8", "12h": "Hour12"}
 TF_HOURS = {"Hour4": 4, "Hour8": 8, "Hour12": 12}
 
-# ---- trigger rules (same for every timeframe) ----
+# ---- trigger rules ----
 MIN_BODY_PCT = 0.3
 CROSS_LOOKBACK = 30
 MAX_ABOVE_EMA20 = 6.0
@@ -61,6 +67,7 @@ RESEND_HOURS = 24
 
 STEP = {"Hour4": 14400, "Hour8": 28800, "Hour12": 43200}
 LAST = {}                 # MEXC last price per symbol
+TICKER = {}               # MEXC symbol -> stock ticker
 
 
 # ---------------- helpers ----------------
@@ -89,6 +96,33 @@ def save_state(s):
     with open(STATE_FILE, "w") as f:
         json.dump(s, f, indent=1)
 
+def stock_flag(x):
+    """True if MEXC tags the contract as a stock (concept plate / name)."""
+    blob = json.dumps(x.get("conceptPlate") or "").upper()
+    return "STOCK" in blob
+
+def classify(x):
+    """Return the stock ticker for a MEXC contract, or None if it is not a stock."""
+    base = str(x.get("baseCoin", "")).upper()
+    sym = str(x.get("symbol", "")).upper().replace("_USDT", "")
+    names = [n for n in (base, sym) if n]
+    # 1) exact match on unambiguous tickers
+    for n in names:
+        if n in STOCKS and n not in AMBIG:
+            return n
+    # 2) ticker + stock suffix (TSLASTOCK, TSLAON, TSLAX ...)
+    for n in names:
+        for suf in SUFFIXES:
+            if n.endswith(suf) and len(n) > len(suf) and n[:-len(suf)] in STOCKS:
+                return n[:-len(suf)]
+    # 3) MEXC flags it as a stock -> use the name without suffix
+    if stock_flag(x) and base:
+        for suf in SUFFIXES:
+            if base.endswith(suf) and len(base) > len(suf) + 1:
+                return base[:-len(suf)]
+        return base
+    return None
+
 def get_symbols():
     j = get(BASE + "/detail")
     if not j or not j.get("data"):
@@ -97,13 +131,15 @@ def get_symbols():
     for x in j["data"]:
         if x.get("quoteCoin") != "USDT" or x.get("state") != 0:
             continue
-        if x.get("baseCoin", "").upper() not in STOCKS:
+        t = classify(x)
+        if not t:
             continue
         syms.append(x["symbol"])
+        TICKER[x["symbol"]] = t
     turn = {}
-    t = get(BASE + "/ticker")
-    if t and t.get("data"):
-        for x in t["data"]:
+    tk = get(BASE + "/ticker")
+    if tk and tk.get("data"):
+        for x in tk["data"]:
             try:
                 turn[x["symbol"]] = float(x.get("amount24") or 0)
                 LAST[x["symbol"]] = float(x.get("lastPrice") or 0)
@@ -112,6 +148,29 @@ def get_symbols():
     if turn:
         syms = [s for s in syms if turn.get(s, 0) >= MIN_TURNOVER]
     return syms, turn
+
+def list_contracts():
+    """LIST mode: show how MEXC really names its stock contracts."""
+    j = get(BASE + "/detail")
+    if not j or not j.get("data"):
+        print("no data from MEXC")
+        return
+    probe = ("TSLA", "NVDA", "AAPL", "COIN", "HOOD", "MSFT", "AMZN", "GOOGL", "META", "MCD")
+    shown = 0
+    for x in j["data"]:
+        base = str(x.get("baseCoin", "")).upper()
+        sym = str(x.get("symbol", "")).upper()
+        hit = stock_flag(x) or classify(x) or any(base.startswith(p) or sym.startswith(p) for p in probe)
+        if not hit:
+            continue
+        print(f"{x.get('symbol')} | base={x.get('baseCoin')} | name={x.get('displayNameEn')} | "
+              f"quote={x.get('quoteCoin')} | state={x.get('state')} | plate={x.get('conceptPlate')}")
+        shown += 1
+        if shown == 1:
+            print("SAMPLE FULL RECORD:", json.dumps(x)[:1500])
+        if shown >= 120:
+            break
+    print("contracts shown:", shown)
 
 def klines(sym, interval, n=500):
     end = int(time.time())
@@ -171,11 +230,12 @@ def grade(score):
 
 # ---------------- Yahoo weekly data (full history) ----------------
 def yahoo_ticker(sym):
-    base = sym.replace("_USDT", "").upper()
-    return YAHOO_MAP.get(base, base)
+    t = TICKER.get(sym) or sym.replace("_USDT", "").upper()
+    return YAHOO_MAP.get(t, t)
 
 def yahoo_weekly(ticker):
     """Full weekly history from Yahoo. Returns (closed weekly df, live price)."""
+    raw = None
     for i in range(3):
         try:
             raw = yf.Ticker(ticker).history(period="max", interval="1wk",
@@ -230,8 +290,7 @@ def analyze_zone(sym, gate=True):
         tkr = yahoo_ticker(sym)
         df, live = yahoo_weekly(tkr)
         if df is None or len(df) < MIN_BARS:
-            if gate:
-                print("no/short yahoo data:", sym, tkr)
+            print("no/short yahoo data:", sym, tkr)
             return None
         mx = LAST.get(sym, 0)
         if mx and live and abs(live / mx - 1) > MAX_PRICE_DIFF:
@@ -362,7 +421,7 @@ def candles(ax, df):
 def make_chart(z, h4, info, total, tgt, tf):
     fig, (a2, a1) = plt.subplots(2, 1, figsize=(12, 13),
                                  gridspec_kw={"height_ratios": [3, 2]})
-    name = z["symbol"].replace("_USDT", "")
+    name = z["ticker"]
     h = h4.iloc[-90:].reset_index(drop=True)
     candles(a2, h)
     for n, c in ((6, "#e377c2"), (12, "#ff9f40"), (20, "#6c5ce7")):
@@ -384,7 +443,6 @@ def make_chart(z, h4, info, total, tgt, tf):
     a2.set_title(f'{name} {tf} | Grade {grade(total)} ({total:.0f}/100) | '
                  f'crossed {info["since"]} candles ago | vol x{info["vr"]} | '
                  f'next target {tgt:.6g}', fontsize=12)
-    # weekly (Yahoo)
     df = z["wk"].iloc[-130:].reset_index(drop=True)
     a1.set_facecolor("#fff8c4")
     candles(a1, df)
@@ -438,9 +496,18 @@ def tg_text(text):
 
 
 # ---------------- test mode ----------------
-def debug(sym):
-    sym = sym.upper().replace("USDT", "").replace("_", "") + "_USDT"
+def debug(inp):
     get_symbols()
+    want = inp.upper().replace("USDT", "").replace("_", "")
+    sym = None
+    for s, t in TICKER.items():
+        if t == want:
+            sym = s
+            break
+    if sym is None:
+        print(f"{want} not found among MEXC stock contracts. Run LIST to see names.")
+        print("matched stock contracts:", ", ".join(f"{s}={t}" for s, t in TICKER.items()))
+        return
     z = analyze_zone(sym, gate=False)
     print("==== TEST", sym, "(yahoo:", yahoo_ticker(sym), ") ====")
     if z is None:
@@ -466,6 +533,9 @@ def debug(sym):
 # ---------------- main ----------------
 def main():
     dbg = os.environ.get("DEBUG_SYMBOL", "").strip()
+    if dbg.upper() == "LIST":
+        list_contracts()
+        return
     if dbg:
         debug(dbg)
         return
@@ -476,9 +546,10 @@ def main():
     now_iso = now_dt.isoformat()
 
     syms, turn = get_symbols()
-    print("MEXC stock pairs:", len(syms), "->", ", ".join(s.replace("_USDT", "") for s in syms))
+    print("MEXC stock pairs:", len(syms), "->",
+          ", ".join(f"{s}={TICKER.get(s)}" for s in syms))
     if not syms:
-        print("no stock pairs returned by MEXC, exiting")
+        print("no stock pairs found. Run the workflow with debug_symbol = LIST")
         return
     with ThreadPoolExecutor(4) as ex:
         zones = [z for z in ex.map(analyze_zone, syms) if z]
@@ -486,7 +557,7 @@ def main():
     print("zone pairs:", len(zmap))
 
     for s in list(state["watchlist"]):
-        if s not in zmap:
+        if s not in zmap and s in TICKER:
             z = analyze_zone(s, gate=False)
             if z:
                 zmap[s] = z
@@ -573,6 +644,7 @@ def main():
     for sc, sym, z, info, tf in new:
         state["watchlist"][sym] = dict(added=now_iso, score=round(sc, 1),
                                        gap_pct=info["gap"], tf=tf,
+                                       ticker=z["ticker"],
                                        zone_low=z["zone_low"],
                                        zone_high=z["zone_high"], sl=z["sl"])
 
@@ -587,7 +659,8 @@ def main():
         rows = sorted(state["watchlist"].items(), key=lambda kv: kv[1].get("score", 0), reverse=True)
         lines = [f"📋 Stocks Watchlist ({len(rows)}) - ready to cross EMA20 (4h/8h/12h)"]
         for i, (s, w) in enumerate(rows, 1):
-            lines.append(f"{i}. {s.replace('_USDT', '')}  [{w.get('tf', '4h')}]  "
+            nm = w.get("ticker") or TICKER.get(s) or s.replace("_USDT", "")
+            lines.append(f"{i}. {nm}  [{w.get('tf', '4h')}]  "
                          f"score {w.get('score', '?')}  gap {w.get('gap_pct', '?')}%")
         tg_text("\n".join(lines))
         state["last_summary"] = today
