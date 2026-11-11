@@ -1,10 +1,11 @@
 import os, io, json, time, requests
 import pandas as pd
+import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 BASE = "https://contract.mexc.com/api/v1/contract"
 STATE_FILE = "state_stocks.json"
@@ -18,12 +19,15 @@ STOCKS = {
     "PFE","XOM","CVX","KO","PEP","MCD","SBUX","ADBE","CRM","QCOM","TSM","ASML",
     "ARM","SMCI","SNOW","NET","DDOG","ROKU","SNAP","PINS","ABNB","LYFT","F","GM",
     "GME","AMC","RIVN","LCID","NIO","XPEV","LI","MARA","RIOT","CLSK","IBIT",
-    "BMNR","SBET","FIG","APP","IONQ","RKLT","OKLO","SMR","RGTI","QBTS","DELL",
+    "BMNR","SBET","FIG","APP","IONQ","OKLO","SMR","RGTI","QBTS","DELL",
     "TXN","CSCO","IBM","T","VZ","BAC","WFC","GS","MS","C","LLY","UNH","JNJ",
-    "MRK","ABBV","HD","LOW","TGT","NOW","PANW","CRWD","ZS","SHOPIFY","SPOT",
+    "MRK","ABBV","HD","LOW","TGT","NOW","PANW","CRWD","ZS","SPOT",
 }
 _extra = os.environ.get("EXTRA_STOCKS", "")
 STOCKS |= {x.strip().upper() for x in _extra.split(",") if x.strip()}
+
+# MEXC base coin -> Yahoo ticker (only where they differ)
+YAHOO_MAP = {"BRKB": "BRK-B", "BRK.B": "BRK-B", "BFB": "BF-B"}
 
 # ---- weekly accumulation zone rules (tuned for stocks) ----
 MIN_DD = 40               # min drawdown from ATH (%)
@@ -32,8 +36,9 @@ ZONE_PCT = 0.25           # accumulation zone = 52w low -> +25%
 MAX_ABOVE_LOW = 0.35      # max % above 52w low (0.35 = 35%)
 MAX_4W_PUMP = 0.30
 MIN_BARS = 20
+MAX_PRICE_DIFF = 0.25     # Yahoo vs MEXC price must be within 25% (collision guard)
 
-# ---- trigger timeframes (4h, 8h, 12h) ----
+# ---- trigger timeframes (4h, 8h, 12h) on MEXC perp candles ----
 TFS = {"4h": "Hour4", "8h": "Hour8", "12h": "Hour12"}
 TF_HOURS = {"Hour4": 4, "Hour8": 8, "Hour12": 12}
 
@@ -41,20 +46,21 @@ TF_HOURS = {"Hour4": 4, "Hour8": 8, "Hour12": 12}
 MIN_BODY_PCT = 0.3
 CROSS_LOOKBACK = 30
 MAX_ABOVE_EMA20 = 6.0
-MAX_3D_PUMP = 15.0        # skip if already +15% in last 3 days
+MAX_3D_PUMP = 15.0
 READY_PCT = 2.5
 
 # ---- smart filters ----
-MIN_TURNOVER = 20_000     # min 24h USDT turnover
+MIN_TURNOVER = 20_000
 ALERT_MIN_SCORE = 70      # Grade A only
 MIN_RR = 1.0
-MARKET_CRASH_BLOCK = 3.0  # pause alerts if SPY/BTC fell >3% in last 2 candles
+MARKET_CRASH_BLOCK = 3.0
 
 WATCHLIST_MAX = 40
 WATCH_MAX_DAYS = 21
 RESEND_HOURS = 24
 
-STEP = {"Week1": 604800, "Hour4": 14400, "Hour8": 28800, "Hour12": 43200}
+STEP = {"Hour4": 14400, "Hour8": 28800, "Hour12": 43200}
+LAST = {}                 # MEXC last price per symbol
 
 
 # ---------------- helpers ----------------
@@ -100,6 +106,7 @@ def get_symbols():
         for x in t["data"]:
             try:
                 turn[x["symbol"]] = float(x.get("amount24") or 0)
+                LAST[x["symbol"]] = float(x.get("lastPrice") or 0)
             except Exception:
                 pass
     if turn:
@@ -162,6 +169,42 @@ def grade(score):
     return "A" if score >= 70 else ("B" if score >= 55 else "C")
 
 
+# ---------------- Yahoo weekly data (full history) ----------------
+def yahoo_ticker(sym):
+    base = sym.replace("_USDT", "").upper()
+    return YAHOO_MAP.get(base, base)
+
+def yahoo_weekly(ticker):
+    """Full weekly history from Yahoo. Returns (closed weekly df, live price)."""
+    for i in range(3):
+        try:
+            raw = yf.Ticker(ticker).history(period="max", interval="1wk",
+                                            auto_adjust=False)
+            if raw is not None and len(raw) > 0:
+                break
+        except Exception:
+            raw = None
+        time.sleep(2 + i)
+    if raw is None or len(raw) == 0:
+        return None, None
+    raw = raw.dropna(subset=["Open", "High", "Low", "Close"])
+    if len(raw) == 0:
+        return None, None
+    idx = raw.index.tz_localize(None) if raw.index.tz is not None else raw.index
+    df = pd.DataFrame({"t": pd.to_datetime(idx),
+                       "o": raw["Open"].values, "h": raw["High"].values,
+                       "l": raw["Low"].values, "c": raw["Close"].values,
+                       "v": raw["Volume"].values})
+    live = float(df.c.iloc[-1])
+    # last row is the running week until Friday's US close (~21:00 UTC)
+    wk_close = df.t.iloc[-1] + timedelta(days=4, hours=21)
+    if datetime.utcnow() < wk_close:
+        df = df.iloc[:-1]
+    df = df.reset_index(drop=True)
+    df["ts"] = (df.t.astype("int64") // 10**9).astype(int)
+    return df, live
+
+
 # ---------------- scoring ----------------
 def weekly_score(dd, above, rng, r, div):
     s = min(dd, 80) / 80 * 15
@@ -181,13 +224,20 @@ def trigger_score(since, vr, body, stack, slope, ext):
     return s                                   # max 60
 
 
-# ---------------- weekly accumulation zone ----------------
+# ---------------- weekly accumulation zone (Yahoo data) ----------------
 def analyze_zone(sym, gate=True):
     try:
-        full = klines(sym, "Week1")
-        if full is None or len(full) < MIN_BARS + 1:
+        tkr = yahoo_ticker(sym)
+        df, live = yahoo_weekly(tkr)
+        if df is None or len(df) < MIN_BARS:
+            if gate:
+                print("no/short yahoo data:", sym, tkr)
             return None
-        df = closed(full, STEP["Week1"])
+        mx = LAST.get(sym, 0)
+        if mx and live and abs(live / mx - 1) > MAX_PRICE_DIFF:
+            print(f"price mismatch (yahoo {live:.4g} vs mexc {mx:.4g}), skip", sym)
+            if gate:
+                return None
         ath = float(df.h.max())
         low = float(df.l.iloc[-LOW_WEEKS:].min())
         close = float(df.c.iloc[-1])
@@ -202,17 +252,18 @@ def analyze_zone(sym, gate=True):
             return None
         ws = weekly_score(dd, above, rng, r, div)
         fib = [low + (ath - low) * f for f in (0.236, 0.382, 0.618)]
-        return dict(symbol=sym, passed=passed, wscore=round(ws, 1),
+        return dict(symbol=sym, ticker=tkr, passed=passed, wscore=round(ws, 1),
                     dd=round(dd, 1), above_low_pct=round(above * 100, 1),
                     pump4w_pct=round(pump4 * 100, 1), rsi=round(r, 1),
-                    divergence=div, low52=low,
+                    divergence=div, low52=low, ath=ath,
                     zone_low=low, zone_high=low * (1 + ZONE_PCT), sl=low * 0.97,
-                    t1=fib[0], t2=fib[1], t3=fib[2], wk=full)
-    except Exception:
+                    t1=fib[0], t2=fib[1], t3=fib[2], wk=df)
+    except Exception as e:
+        print("zone error", sym, e)
         return None
 
 
-# ---------------- trigger status (one timeframe) ----------------
+# ---------------- trigger status (one timeframe, MEXC perp candles) ----------------
 def tf_status(sym, tf):
     try:
         h4 = klines_tf(sym, tf, 300)
@@ -237,7 +288,7 @@ def tf_status(sym, tf):
         stack = bool(last.e6 > last.e12 > last.e20)
         slope = bool(last.e20 > hc.e20.iloc[-4])
         swing_sl = float(hc.l.iloc[-12:].min()) * 0.995
-        bars_3d = 72 // TF_HOURS[tf]              # 18 / 9 / 6 candles = 3 days
+        bars_3d = 72 // TF_HOURS[tf]
         pump3d = float((last.c / hc.l.iloc[-bars_3d:].min() - 1) * 100)
         green_above = bool(last.c > last.o and last.c > last.e6
                            and last.c > last.e12 and last.c > last.e20
@@ -258,7 +309,6 @@ def tf_status(sym, tf):
         return None, None, {}
 
 def all_status(sym):
-    """Run the trigger check on 4h, 8h and 12h."""
     out = {}
     for label, tf in TFS.items():
         st, df, info = tf_status(sym, tf)
@@ -268,7 +318,6 @@ def all_status(sym):
     return out
 
 def pick(res):
-    """Best timeframe: triggered (highest score) first, else 'ready' (smallest gap)."""
     trig = [(l, v) for l, v in res.items() if v[0] == "triggered"]
     if trig:
         l, v = max(trig, key=lambda x: (x[1][2]["s4"], TF_HOURS[TFS[x[0]]]))
@@ -313,7 +362,7 @@ def candles(ax, df):
 def make_chart(z, h4, info, total, tgt, tf):
     fig, (a2, a1) = plt.subplots(2, 1, figsize=(12, 13),
                                  gridspec_kw={"height_ratios": [3, 2]})
-    # ---------- trigger timeframe (top, big) ----------
+    name = z["symbol"].replace("_USDT", "")
     h = h4.iloc[-90:].reset_index(drop=True)
     candles(a2, h)
     for n, c in ((6, "#e377c2"), (12, "#ff9f40"), (20, "#6c5ce7")):
@@ -324,7 +373,7 @@ def make_chart(z, h4, info, total, tgt, tf):
     a2.axhline(sl4, color="red", ls="--", lw=1.2, label=f"{tf} SL {sl4:.6g}")
     lo = min(float(h.l.min()), sl4) * 0.98
     hi = float(max(h.h.max(), h.e20.max())) * 1.04
-    if tgt <= hi * 1.5:                       # draw target only if it fits
+    if tgt <= hi * 1.5:
         a2.axhline(tgt, color="blue", ls="--", lw=1.2, label=f"Target {tgt:.6g}")
         hi = max(hi, tgt * 1.02)
     a2.set_ylim(lo, hi)
@@ -332,15 +381,16 @@ def make_chart(z, h4, info, total, tgt, tf):
     st = max(len(h) // 8, 1)
     a2.set_xticks(range(0, len(h), st))
     a2.set_xticklabels(h.t.dt.strftime("%d %b %H:%M")[::st], fontsize=8)
-    a2.set_title(f'{z["symbol"]} {tf} | Grade {grade(total)} ({total:.0f}/100) | '
+    a2.set_title(f'{name} {tf} | Grade {grade(total)} ({total:.0f}/100) | '
                  f'crossed {info["since"]} candles ago | vol x{info["vr"]} | '
                  f'next target {tgt:.6g}', fontsize=12)
-    # ---------- weekly (bottom) ----------
+    # weekly (Yahoo)
     df = z["wk"].iloc[-130:].reset_index(drop=True)
     a1.set_facecolor("#fff8c4")
     candles(a1, df)
     a1.axhspan(z["zone_low"], z["zone_high"], color="green", alpha=0.25, label="Accumulation Zone")
     a1.axhline(z["sl"], color="red", ls="--", label="SL (1W close below)")
+    a1.axhline(z["ath"], color="black", ls=":", lw=1, label=f"ATH {z['ath']:.6g}")
     for k, c in (("t1", "blue"), ("t2", "purple"), ("t3", "navy")):
         a1.axhline(z[k], color=c, lw=0.8, label=f"{k.upper()} {z[k]:.6g}")
     a1.set_yscale("log")
@@ -348,9 +398,8 @@ def make_chart(z, h4, info, total, tgt, tf):
     st = max(len(df) // 6, 1)
     a1.set_xticks(range(0, len(df), st))
     a1.set_xticklabels(df.t.dt.strftime("%b %y")[::st])
-    a1.set_title(f'1W | DD {z["dd"]}% | +{z["above_low_pct"]}% above 52w low', fontsize=11)
+    a1.set_title(f'1W (Yahoo) | DD {z["dd"]}% | +{z["above_low_pct"]}% above 52w low', fontsize=11)
 
-    # ---------- watermark ----------
     fig.text(0.5, 0.5, WATERMARK, fontsize=90, color="gray", alpha=0.15,
              ha="center", va="center", rotation=30, fontweight="bold", zorder=0)
 
@@ -391,12 +440,14 @@ def tg_text(text):
 # ---------------- test mode ----------------
 def debug(sym):
     sym = sym.upper().replace("USDT", "").replace("_", "") + "_USDT"
+    get_symbols()
     z = analyze_zone(sym, gate=False)
-    print("==== TEST", sym, "====")
+    print("==== TEST", sym, "(yahoo:", yahoo_ticker(sym), ") ====")
     if z is None:
-        print("no weekly data / not enough bars")
+        print("no yahoo weekly data / not enough bars")
         return
-    print(f"WEEKLY  52w low {z['low52']:.6g} | drawdown {z['dd']}% (need >= {MIN_DD})")
+    print(f"MEXC last {LAST.get(sym)} | ATH {z['ath']:.6g} | 52w low {z['low52']:.6g}")
+    print(f"WEEKLY  drawdown {z['dd']}% (need >= {MIN_DD})")
     print(f"WEEKLY  above low {z['above_low_pct']}% (need <= {MAX_ABOVE_LOW*100:.0f}) | 4w pump {z['pump4w_pct']}%")
     print(f"WEEKLY  ZONE PASSED: {z['passed']} | RSI {z['rsi']} | div {z['divergence']} | wscore {z['wscore']}/40")
     res = all_status(sym)
@@ -425,11 +476,11 @@ def main():
     now_iso = now_dt.isoformat()
 
     syms, turn = get_symbols()
-    print("stock pairs:", len(syms), "->", ", ".join(s.replace("_USDT", "") for s in syms))
+    print("MEXC stock pairs:", len(syms), "->", ", ".join(s.replace("_USDT", "") for s in syms))
     if not syms:
         print("no stock pairs returned by MEXC, exiting")
         return
-    with ThreadPoolExecutor(6) as ex:
+    with ThreadPoolExecutor(4) as ex:
         zones = [z for z in ex.map(analyze_zone, syms) if z]
     zmap = {z["symbol"]: z for z in zones}
     print("zone pairs:", len(zmap))
@@ -440,7 +491,6 @@ def main():
             if z:
                 zmap[s] = z
 
-    # results[sym] = (status, tf_label, df, info, other_triggered_tfs)
     results = {}
     def chk(sym):
         return sym, pick(all_status(sym))
@@ -476,15 +526,15 @@ def main():
         mk_txt = (f"{mk['name']} 4h above EMA20 ✅" if mk["above"]
                   else f"{mk['name']} 4h below EMA20 ⚠️")
         oth_txt = f"Also triggered: {', '.join(others)}\n" if others else ""
-        cap = (f"📈 {sym.replace('_USDT', '')} (stock) | {tf} | Grade {grade(total)} ({total:.0f}/100)\n"
+        cap = (f"📈 {z['ticker']} (stock) | {tf} | Grade {grade(total)} ({total:.0f}/100)\n"
                f"{tf} closed green above EMA20 (crossed {info['since']} candles ago, "
                f"vol x{info['vr']}, {info['ext']}% above EMA20)\n"
                f"{oth_txt}"
-               f"Live: {price:.6g}\n"
+               f"MEXC live: {price:.6g}\n"
                f"{tf} SL: {info['swing_sl']:.6g} | Weekly SL: {z['sl']:.6g}\n"
                f"Next target: {tgt:.6g} | R:R {rr}\n"
                f"T1 {z['t1']:.6g} | T2 {z['t2']:.6g} | T3 {z['t3']:.6g}\n"
-               f"DD from ATH {z['dd']}% | +{z['above_low_pct']}% above 52w low | "
+               f"ATH {z['ath']:.6g} | DD {z['dd']}% | +{z['above_low_pct']}% above 52w low | "
                f"RSI(1W) {z['rsi']} | Div {z['divergence']}\n"
                f"{mk_txt}")
         try:
