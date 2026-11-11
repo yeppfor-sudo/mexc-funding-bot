@@ -1,0 +1,51 @@
+name: Stocks Scanner
+
+on:
+  schedule:
+    - cron: "3 0,4,8,12,16,20 * * *"   # just after every 4h candle close (UTC)
+  workflow_dispatch:
+    inputs:
+      debug_symbol:
+        description: "Test one stock (e.g. TSLA). Leave empty for full scan"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stocks-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEBUG_SYMBOL: ${{ github.event.inputs.debug_symbol }}
+          EXTRA_STOCKS: ${{ vars.EXTRA_STOCKS }}
+        run: python stocks_scanner.py
+
+      - name: Save state
+        if: ${{ github.event.inputs.debug_symbol == '' }}
+        run: |
+          git config user.name "scanner-bot"
+          git config user.email "scanner-bot@users.noreply.github.com"
+          git add state_stocks.json
+          git diff --staged --quiet || git commit -m "update stocks state"
+          git pull --rebase
+          git push
