@@ -7,40 +7,53 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 BASE = "https://contract.mexc.com/api/v1/contract"
-STATE_FILE = "state.json"
+STATE_FILE = "state_stocks.json"
 WATERMARK = "RANJHA"
 
-# ---- weekly accumulation zone rules ----
-MIN_DD = 80
+# ---- stock universe (MEXC base coins). Add more here or via EXTRA_STOCKS env ----
+STOCKS = {
+    "TSLA","NVDA","AAPL","MSFT","AMZN","GOOGL","GOOG","META","COIN","MSTR","HOOD",
+    "CRCL","NFLX","AMD","PLTR","INTC","BABA","ORCL","AVGO","MU","CRWV","UBER",
+    "PYPL","SHOP","SOFI","RDDT","BA","DIS","JPM","V","MA","WMT","COST","NKE",
+    "PFE","XOM","CVX","KO","PEP","MCD","SBUX","ADBE","CRM","QCOM","TSM","ASML",
+    "ARM","SMCI","SNOW","NET","DDOG","ROKU","SNAP","PINS","ABNB","LYFT","F","GM",
+    "GME","AMC","RIVN","LCID","NIO","XPEV","LI","MARA","RIOT","CLSK","IBIT",
+    "BMNR","SBET","FIG","APP","IONQ","RKLT","OKLO","SMR","RGTI","QBTS","DELL",
+    "TXN","CSCO","IBM","T","VZ","BAC","WFC","GS","MS","C","LLY","UNH","JNJ",
+    "MRK","ABBV","HD","LOW","TGT","NOW","PANW","CRWD","ZS","SHOPIFY","SPOT",
+}
+_extra = os.environ.get("EXTRA_STOCKS", "")
+STOCKS |= {x.strip().upper() for x in _extra.split(",") if x.strip()}
+
+# ---- weekly accumulation zone rules (tuned for stocks) ----
+MIN_DD = 40               # min drawdown from ATH (%)
 LOW_WEEKS = 52
-ZONE_PCT = 0.5
-MAX_ABOVE_LOW = 0.6
-MAX_4W_PUMP = 0.6
-MIN_BARS = 30
+ZONE_PCT = 0.25           # accumulation zone = 52w low -> +25%
+MAX_ABOVE_LOW = 0.35      # max % above 52w low (0.35 = 35%)
+MAX_4W_PUMP = 0.30
+MIN_BARS = 20
 
 # ---- trigger timeframes (4h, 8h, 12h) ----
 TFS = {"4h": "Hour4", "8h": "Hour8", "12h": "Hour12"}
 TF_HOURS = {"Hour4": 4, "Hour8": 8, "Hour12": 12}
 
 # ---- trigger rules (same for every timeframe) ----
-MIN_BODY_PCT = 0.5
+MIN_BODY_PCT = 0.3
 CROSS_LOOKBACK = 30
-MAX_ABOVE_EMA20 = 12.0
-MAX_3D_PUMP = 45.0        # skip if already +45% in last 3 days
-READY_PCT = 4.0
+MAX_ABOVE_EMA20 = 6.0
+MAX_3D_PUMP = 15.0        # skip if already +15% in last 3 days
+READY_PCT = 2.5
 
 # ---- smart filters ----
-MIN_TURNOVER = 50_000     # min 24h USDT turnover
+MIN_TURNOVER = 20_000     # min 24h USDT turnover
 ALERT_MIN_SCORE = 70      # Grade A only
-MIN_RR = 1.0              # min reward/risk (swing SL -> next target)
-BTC_CRASH_BLOCK = 4.0     # pause alerts if BTC fell >4% in last 2 candles
+MIN_RR = 1.0
+MARKET_CRASH_BLOCK = 3.0  # pause alerts if SPY/BTC fell >3% in last 2 candles
 
 WATCHLIST_MAX = 40
 WATCH_MAX_DAYS = 21
 RESEND_HOURS = 24
 
-SKIP = {"TSLA","NVDA","AAPL","MSFT","AMZN","GOOGL","META","COIN","MSTR","HOOD",
-        "CRCL","SPY","QQQ","XAU","XAG","GOLD","SILVER","OIL","USOIL"}
 STEP = {"Week1": 604800, "Hour4": 14400, "Hour8": 28800, "Hour12": 43200}
 
 
@@ -78,7 +91,7 @@ def get_symbols():
     for x in j["data"]:
         if x.get("quoteCoin") != "USDT" or x.get("state") != 0:
             continue
-        if x.get("baseCoin", "").upper() in SKIP:
+        if x.get("baseCoin", "").upper() not in STOCKS:
             continue
         syms.append(x["symbol"])
     turn = {}
@@ -151,9 +164,9 @@ def grade(score):
 
 # ---------------- scoring ----------------
 def weekly_score(dd, above, rng, r, div):
-    s = min(dd, 99) / 99 * 15
+    s = min(dd, 80) / 80 * 15
     s += max(0, 1 - above / MAX_ABOVE_LOW) * 10
-    s += max(0, 1 - rng / 1.5) * 7
+    s += max(0, 1 - rng / 0.8) * 7
     s += 5 if r < 40 else (2 if r < 50 else 0)
     s += 3 if div else 0
     return s                                   # max 40
@@ -161,10 +174,10 @@ def weekly_score(dd, above, rng, r, div):
 def trigger_score(since, vr, body, stack, slope, ext):
     s = 20 if since <= 3 else 14 if since <= 8 else 8 if since <= 15 else 3
     s += 15 if vr >= 2 else 10 if vr >= 1.5 else 5 if vr >= 1.2 else 0
-    s += min(body, 6) / 6 * 8
+    s += min(body, 3) / 3 * 8
     s += 7 if stack else 0
     s += 5 if slope else 0
-    s += 5 if ext <= 4 else 2 if ext <= 8 else 0
+    s += 5 if ext <= 2 else 2 if ext <= 4 else 0
     return s                                   # max 60
 
 
@@ -273,15 +286,21 @@ def plan(z, price, swing_sl):
     rr = (tgt - price) / risk if risk > 0 and tgt > price else 0.0
     return tgt, round(rr, 2)
 
-def btc_regime():
-    try:
-        b = klines("BTC_USDT", "Hour4", 100)
-        b["e20"] = ema(b.c, 20)
-        bc = closed(b, STEP["Hour4"])
-        chg2 = float((bc.c.iloc[-1] / bc.c.iloc[-3] - 1) * 100)
-        return dict(above=bool(bc.c.iloc[-1] > bc.e20.iloc[-1]), chg2=round(chg2, 2))
-    except Exception:
-        return dict(above=True, chg2=0.0)
+def market_regime():
+    """SPY perp if MEXC lists it, otherwise BTC."""
+    for sym, name in (("SPY_USDT", "SPY"), ("BTC_USDT", "BTC")):
+        try:
+            b = klines(sym, "Hour4", 100)
+            if b is None or len(b) < 30:
+                continue
+            b["e20"] = ema(b.c, 20)
+            bc = closed(b, STEP["Hour4"])
+            chg2 = float((bc.c.iloc[-1] / bc.c.iloc[-3] - 1) * 100)
+            return dict(name=name, above=bool(bc.c.iloc[-1] > bc.e20.iloc[-1]),
+                        chg2=round(chg2, 2))
+        except Exception:
+            continue
+    return dict(name="MKT", above=True, chg2=0.0)
 
 
 # ---------------- chart + telegram ----------------
@@ -406,9 +425,9 @@ def main():
     now_iso = now_dt.isoformat()
 
     syms, turn = get_symbols()
-    print("pairs (liquid crypto):", len(syms))
+    print("stock pairs:", len(syms), "->", ", ".join(s.replace("_USDT", "") for s in syms))
     if not syms:
-        print("no pairs returned by MEXC, exiting")
+        print("no stock pairs returned by MEXC, exiting")
         return
     with ThreadPoolExecutor(6) as ex:
         zones = [z for z in ex.map(analyze_zone, syms) if z]
@@ -429,9 +448,9 @@ def main():
         for sym, r in ex.map(chk, list(zmap)):
             results[sym] = r
 
-    btc = btc_regime()
-    btc_blocked = btc["chg2"] <= -BTC_CRASH_BLOCK
-    print("BTC regime:", btc, "| blocked:", btc_blocked)
+    mk = market_regime()
+    blocked = mk["chg2"] <= -MARKET_CRASH_BLOCK
+    print("market regime:", mk, "| blocked:", blocked)
 
     # 1) alerts (best score first)
     cands = []
@@ -446,17 +465,18 @@ def main():
     cands.sort(key=lambda x: x[0], reverse=True)
 
     for total, sym, z, h4, info, price, tgt, rr, tf, others in cands:
-        if btc_blocked:
-            print("BTC crash block, skip", sym)
+        if blocked:
+            print("market crash block, skip", sym)
             continue
         if grade(total) != "A" or total < ALERT_MIN_SCORE or rr < MIN_RR:
             print("filtered (not grade A / low RR)", sym, tf, round(total, 1), "rr", rr)
             continue
         if now - state["sent"].get(sym, 0) < RESEND_HOURS * 3600:
             continue
-        btc_txt = "BTC 4h above EMA20 ✅" if btc["above"] else "BTC 4h below EMA20 ⚠️"
+        mk_txt = (f"{mk['name']} 4h above EMA20 ✅" if mk["above"]
+                  else f"{mk['name']} 4h below EMA20 ⚠️")
         oth_txt = f"Also triggered: {', '.join(others)}\n" if others else ""
-        cap = (f"🚀 {sym} | {tf} | Grade {grade(total)} ({total:.0f}/100)\n"
+        cap = (f"📈 {sym.replace('_USDT', '')} (stock) | {tf} | Grade {grade(total)} ({total:.0f}/100)\n"
                f"{tf} closed green above EMA20 (crossed {info['since']} candles ago, "
                f"vol x{info['vr']}, {info['ext']}% above EMA20)\n"
                f"{oth_txt}"
@@ -466,7 +486,7 @@ def main():
                f"T1 {z['t1']:.6g} | T2 {z['t2']:.6g} | T3 {z['t3']:.6g}\n"
                f"DD from ATH {z['dd']}% | +{z['above_low_pct']}% above 52w low | "
                f"RSI(1W) {z['rsi']} | Div {z['divergence']}\n"
-               f"{btc_txt}")
+               f"{mk_txt}")
         try:
             if tg_photo(make_chart(z, h4, info, total, tgt, tf), cap):
                 state["sent"][sym] = now
@@ -515,9 +535,10 @@ def main():
     today = now_dt.strftime("%Y-%m-%d")
     if state.get("last_summary") != today and state["watchlist"]:
         rows = sorted(state["watchlist"].items(), key=lambda kv: kv[1].get("score", 0), reverse=True)
-        lines = [f"📋 Watchlist ({len(rows)}) - ready to cross EMA20 (4h/8h/12h)"]
+        lines = [f"📋 Stocks Watchlist ({len(rows)}) - ready to cross EMA20 (4h/8h/12h)"]
         for i, (s, w) in enumerate(rows, 1):
-            lines.append(f"{i}. {s}  [{w.get('tf', '4h')}]  score {w.get('score', '?')}  gap {w.get('gap_pct', '?')}%")
+            lines.append(f"{i}. {s.replace('_USDT', '')}  [{w.get('tf', '4h')}]  "
+                         f"score {w.get('score', '?')}  gap {w.get('gap_pct', '?')}%")
         tg_text("\n".join(lines))
         state["last_summary"] = today
 
